@@ -398,7 +398,7 @@ pub struct LeaderArgs {
 }
 #[derive(Debug, Clone, Parser)]
 #[command(
-    name = "grok",
+    name = "abxglia-grok",
     version = env!("VERSION_WITH_COMMIT"),
     about = "Grok Build TUI",
     disable_version_flag = true,
@@ -790,8 +790,8 @@ impl PagerArgs {
             .map(std::path::Path::new)
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
-            .filter(|n| *n == "grok" || *n == "agent")
-            .unwrap_or("grok")
+            .filter(|n| *n == "abxglia-grok" || *n == "grok" || *n == "agent")
+            .unwrap_or("abxglia-grok")
             .to_owned();
         Self::parse_from(std::iter::once(bin_name).chain(std::env::args().skip(1)))
     }
