@@ -1,0 +1,43 @@
+{
+  "name": "abxglia-diff-bridge",
+  "displayName": "Abxglia Diff Bridge",
+  "description": "Socket-based diff bridge for abxglia-grok: opens diffs with real file names in the correct Cursor window, auto-closes on permission resolve.",
+  "version": "0.2.3",
+  "publisher": "abxglia",
+  "engines": {
+    "vscode": "^1.87.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./src/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "abxglia-diff-bridge.toggle",
+        "title": "Abxglia: Toggle Diff Bridge"
+      }
+    ],
+    "configuration": {
+      "title": "Abxglia Diff Bridge",
+      "properties": {
+        "abxgliaDiffBridge.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable the diff bridge (socket server + auto-close)."
+        },
+        "abxgliaDiffBridge.grokHome": {
+          "type": "string",
+          "default": "",
+          "description": "GROK_HOME path (defaults to ~/.abxglia-grok). Set if you use a custom GROK_HOME."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "package": "npx @vscode/vsce package"
+  }
+}

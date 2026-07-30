@@ -1694,7 +1694,14 @@ fn tool_call_to_block(tc: &acp::ToolCall, session_cwd: Option<&Path>) -> RenderB
                     > 1;
             let is_write = is_write_tool(tc);
             let mut block = if success {
-                let (hunks, _count) = crate::diff::extract_edit_hunks(tc);
+                // When editor diff review is enabled, the inline diff body is
+                // redundant — pass empty hunks so the block renders as a
+                // header-only summary (the full diff was seen in the editor).
+                let (hunks, _count) = if crate::app::diff_review::editor_review_enabled() {
+                    (vec![], 0)
+                } else {
+                    crate::diff::extract_edit_hunks(tc)
+                };
                 EditToolCallBlock::new(path, hunks)
             } else {
                 let error_msg = extract_edit_error(tc);

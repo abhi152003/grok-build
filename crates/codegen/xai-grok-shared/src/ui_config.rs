@@ -36,6 +36,10 @@ pub struct UiConfig {
     /// the pager's permission view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_selected_permission: Option<String>,
+    /// Open a visual diff in the user's editor when an edit hits the permission
+    /// gate: `"code"` / `"cursor"` / `"auto"` ($EDITOR). Unset = off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_review_editor: Option<String>,
     /// Written by the pager's appearance persist module.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub show_timestamps: Option<bool>,
@@ -254,6 +258,7 @@ impl Default for UiConfig {
             permission_mode: None,
             approval_mode: None,
             default_selected_permission: None,
+            diff_review_editor: None,
             show_timestamps: None,
             show_timeline: None,
             page_flip_on_send: None,

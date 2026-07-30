@@ -57,6 +57,20 @@ pub fn user_grok_home() -> Option<PathBuf> {
     resolvable.then(grok_home)
 }
 
+/// The foreign sessions root (`~/.grok/sessions`), for one-way read-only
+/// resume of sessions created by the released `grok` when this build uses a
+/// different `GROK_HOME`. Returns `None` when our own `GROK_HOME` IS `~/.grok`
+/// or when the foreign tree doesn't exist.
+pub fn foreign_sessions_root() -> Option<PathBuf> {
+    let own_home = grok_home();
+    let default_grok = default_grok_home();
+    if own_home == default_grok {
+        return None;
+    }
+    let foreign_sessions = default_grok.join("sessions");
+    foreign_sessions.is_dir().then_some(foreign_sessions)
+}
+
 /// Canonical grok application path: `$GROK_HOME/bin/grok` (Unix) or `grok.exe` (Windows).
 pub fn grok_application() -> PathBuf {
     grok_application_in(&grok_home())

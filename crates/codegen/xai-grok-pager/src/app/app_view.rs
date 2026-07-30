@@ -793,9 +793,9 @@ pub struct AppView {
     /// Effects queued by notification handlers (drained by the event loop).
     pub pending_effects: Vec<crate::app::actions::Effect>,
     /// Typed `$EDITOR` work consumed by the event loop after the current cycle.
-    /// Both configuration-file and prompt-draft edits share the existing
-    /// leave-raw-mode / child / restore handoff.
     pub(crate) pending_editor: Option<crate::app::external_editor::PendingEditorRequest>,
+    /// Pending editor diff review (`[ui] diff_review_editor`).
+    pub pending_editor_diff: Option<crate::app::diff_review::PendingEditorDiff>,
     /// Path to open in `$PAGER` (default `less`) after the current event cycle.
     /// Set by `Action::OpenTranscriptPager` (`/transcript`); consumed by the
     /// event loop which suspends the inline TUI, spawns the pager, then restores
@@ -1445,6 +1445,7 @@ impl AppView {
             welcome_tip_typing_dismissed: false,
             pending_effects: Vec::new(),
             pending_editor: None,
+            pending_editor_diff: None,
             pending_pager_path: None,
             pending_pager_ansi: false,
             minimal_state: crate::minimal_api::MinimalState::default(),
@@ -5857,6 +5858,7 @@ pub(crate) mod tests {
             screen_mode: ScreenMode::Inline,
             pending_effects: Vec::new(),
             pending_editor: None,
+            pending_editor_diff: None,
             pending_pager_path: None,
             pending_pager_ansi: false,
             minimal_state: crate::minimal_api::MinimalState::default(),

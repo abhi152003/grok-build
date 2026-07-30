@@ -628,6 +628,39 @@ fn run_pending_suspends(
         }
     }
 
+    // Editor diff-review: open old/new in the configured editor when an edit
+    // hits the permission gate. GUI editors launch detached (prompt stays
+    // visible); terminal editors use the suspend machinery (same as $EDITOR).
+    if let Some(diff) = app.pending_editor_diff.take() {
+        let display_name = diff.display_name();
+        if diff.is_gui() {
+            let opened = diff.run();
+            diff.leak_temp_files();
+            if opened {
+                annotate_active_permission_prompt(app, display_name);
+            }
+        } else {
+            let moved_cursor = match suspend_for_child(
+                app.screen_mode,
+                terminal,
+                input_paused,
+                reader_parked,
+                input_rx,
+                || {
+                    let _ = diff.run();
+                },
+            ) {
+                Ok(moved_cursor) => moved_cursor,
+                Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                    return Ok(());
+                }
+                Err(error) => return Err(error.into()),
+            };
+            restore_after_child(terminal, app.screen_mode, moved_cursor);
+            presenter.request_presentation(app, terminal, true);
+        }
+    }
+
     // /transcript suspend: open the rendered transcript in $PAGER,
     // then restore and delete the temp file. Shares the editor's
     // suspend/restore dance (reader park, raw mode, alt screen).
@@ -708,6 +741,19 @@ fn run_pending_suspends(
         suspend_wait_reports.pager_reported = false;
     }
     Ok(())
+}
+
+/// Append a "(diff in Cursor)" hint to the most recent permission prompt on
+/// the active agent's queue. Called after a GUI diff launch is confirmed
+/// successful, so the user knows where the diff opened. If there's no active
+/// agent or no pending prompt, this is a no-op (the diff still opened).
+fn annotate_active_permission_prompt(app: &mut AppView, editor_name: &str) {
+    if let crate::app::app_view::ActiveView::Agent(id) = app.active_view
+        && let Some(agent) = app.agents.get_mut(&id)
+        && let Some(prompt) = agent.permission_queue.back_mut()
+    {
+        prompt.title.push_str(&format!("  (diff in {editor_name})"));
+    }
 }
 
 /// Run the main event loop until quit.

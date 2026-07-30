@@ -121,6 +121,9 @@ pub(super) fn dispatch_permission_select(
         .meta(meta)))
         .ok();
 
+    // Signal the editor extension to close the diff tab (if editor review is on).
+    crate::app::diff_review::signal_close_diff_tab();
+
     // Queue transition: restore prompt if queue is now empty, clear if next-front.
     resolve_permission_queue_transition(agent);
 
@@ -198,6 +201,9 @@ pub(super) fn dispatch_permission_followup(app: &mut AppView, text: String) -> V
         .meta(meta)))
         .ok();
 
+    // Signal the editor extension to close the diff tab (if editor review is on).
+    crate::app::diff_review::signal_close_diff_tab();
+
     resolve_permission_queue_transition(agent);
     vec![]
 }
@@ -220,6 +226,9 @@ pub(super) fn dispatch_permission_cancel(app: &mut AppView) -> Vec<Effect> {
             acp::RequestPermissionOutcome::Cancelled,
         )))
         .ok();
+
+    // Signal the editor extension to close the diff tab (if editor review is on).
+    crate::app::diff_review::signal_close_diff_tab();
 
     resolve_permission_queue_transition(agent);
     vec![]

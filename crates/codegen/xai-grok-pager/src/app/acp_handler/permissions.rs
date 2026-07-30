@@ -84,6 +84,20 @@ pub(super) fn handle_permission_request(
     // 4. Queue on the owning agent's view. Subagent provenance for display
     //    is still resolved via subagent_sessions in enqueue_permission().
     //    Redraw is only needed when the owning agent is currently visible.
+
+    // 4a. Editor diff review: arm the diff if this is an edit and the user
+    //     opted in via `[ui] diff_review_editor`. The prompt-title annotation
+    //     is added later in the event loop after `run()` confirms the diff opened.
+    if is_edit_permission(&perm.request)
+        && let Some(setting) = app.current_ui.diff_review_editor.as_deref()
+        && let Some(mode) = crate::app::diff_review::ReviewMode::from_setting(setting)
+        && let Some(raw) = perm.request.tool_call.fields.raw_input.as_ref()
+        && let Some(diff) =
+            crate::app::diff_review::PendingEditorDiff::try_build(raw, mode, app.cwd.clone())
+    {
+        app.pending_editor_diff = Some(diff);
+    }
+
     let needs_redraw = enqueue_permission(perm, agent);
     needs_redraw && is_active
 }

@@ -18,6 +18,8 @@ pub mod cli;
 pub use crate::link_opener;
 /// Off-thread full-file syntax highlight upgrade for edit diffs.
 pub mod edit_highlight_worker;
+/// Open a visual diff in the user's editor when an edit hits the permission gate.
+pub mod diff_review;
 /// Off-thread Mermaid diagram render worker (out of process) + per-session cache.
 pub mod mermaid_worker;
 pub use xai_prompt_queue as prompt_queue;

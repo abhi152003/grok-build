@@ -10,6 +10,8 @@ authors = ["xAI"]
 dunce = { workspace = true }
 xai-tty-utils = { workspace = true }
 xai-grok-version = { workspace = true }
+# Editor diff-review feature (PendingEditorDiff temp files). Also used by tests.
+tempfile = { workspace = true }
 
 # Shared prompt-queue wire types
 xai-prompt-queue = { workspace = true }
@@ -166,7 +168,6 @@ xai-grok-shell = { workspace = true, features = ["test-support"] }
 pretty_assertions = { workspace = true }
 insta = { workspace = true }
 criterion = { workspace = true }
-tempfile = { workspace = true }
 serial_test = { workspace = true }
 xai-grok-agent = { workspace = true }
 xai-grok-pager-pty-harness = { path = "../xai-grok-pager-pty-harness" }

@@ -406,9 +406,15 @@ fn storage_view(sessions_root: &Path) -> RelocationResult<RelocationView> {
 /// "already local" if it lives under the **same** cwd as the current invocation.
 /// A session stored under a different cwd does NOT satisfy this check — the
 /// caller must still run the remote restore into the requested cwd.
+///
+/// When not found locally, checks the foreign root (`~/.grok/sessions`) and
+/// copies the session into the local root if found (one-way resume).
 pub fn session_exists_for_cwd(session_id: &str, cwd: &str) -> bool {
     let sessions_root = crate::util::grok_home::grok_home().join("sessions");
-    session_exists_for_cwd_in_root(session_id, cwd, &sessions_root)
+    if session_exists_for_cwd_in_root(session_id, cwd, &sessions_root) {
+        return true;
+    }
+    try_copy_foreign_session_for_cwd(session_id, cwd)
 }
 
 /// A directory is a resumable session only if it has a `summary.json`; this
@@ -600,9 +606,25 @@ fn find_local_child_for_remote_in_root(
 /// This is used by the pager's `--resume` to find sessions that were created
 /// in a different CWD (e.g., a worktree) than the one the user is currently in.
 pub fn resolve_local_session_any_cwd(session_id: &str) -> Option<String> {
-    resolve_local_session_any_cwd_result(session_id)
-        .ok()
-        .flatten()
+    if let Some(cwd) = resolve_local_session_any_cwd_result(session_id).ok().flatten() {
+        return Some(cwd);
+    }
+    // Foreign root: copy into local root and return the original cwd.
+    let sessions_root = crate::util::grok_home::grok_home().join("sessions");
+    if let Some(foreign_root) = crate::util::grok_home::foreign_sessions_root() {
+        if let Ok(Some(original_cwd)) =
+            resolve_local_session_any_cwd_in_root(session_id, &foreign_root)
+        {
+            let encoded = crate::util::grok_home::encode_cwd_dirname(&original_cwd);
+            let foreign_path = foreign_root.join(&encoded).join(session_id);
+            if copy_foreign_session_to_local(session_id, &encoded, &foreign_path, &sessions_root)
+                .is_ok()
+            {
+                return Some(original_cwd);
+            }
+        }
+    }
+    None
 }
 
 pub fn resolve_local_session_any_cwd_result(session_id: &str) -> io::Result<Option<String>> {
@@ -624,8 +646,33 @@ fn resolve_local_session_any_cwd_in_root(
 }
 
 /// Scan all CWD directories for a session and return its directory path.
+/// When found only in the foreign root, copies it into the local root first
+/// so subsequent writes go to the copy, never the original.
 pub fn find_session_dir_by_id(session_id: &str) -> Option<PathBuf> {
-    find_any_session_dir_by_id_result(session_id).ok().flatten()
+    if let Some(local_path) = find_any_session_dir_by_id_result(session_id).ok().flatten() {
+        return Some(local_path);
+    }
+    // Foreign root: copy into local root if found there.
+    let sessions_root = grok_home().join("sessions");
+    if let Some(foreign_root) = crate::util::grok_home::foreign_sessions_root() {
+        if let Ok(Some(foreign_path)) =
+            find_persisted_session_dir_by_id_in_root_result(session_id, &foreign_root)
+        {
+            // foreign_path = <foreign_root>/<encoded_cwd>/<session_id>
+            if let Some(cwd_dir_name) = foreign_path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+            {
+                if let Ok(local_path) =
+                    copy_foreign_session_to_local(session_id, cwd_dir_name, &foreign_path, &sessions_root)
+                {
+                    return Some(local_path);
+                }
+            }
+        }
+    }
+    None
 }
 
 pub(crate) fn find_persisted_session_dir_by_id_result(
@@ -641,6 +688,59 @@ pub(crate) fn find_persisted_session_dir_by_id_in_root_result(
     storage_view(sessions_root)
         .and_then(|view| view.find_persisted_session_dir(session_id))
         .map_err(io::Error::other)
+}
+
+/// Check the foreign root for a session under `cwd`; if found, copy it into
+/// the local root. Returns `true` if the session is now local.
+fn try_copy_foreign_session_for_cwd(session_id: &str, cwd: &str) -> bool {
+    let Some(foreign_root) = crate::util::grok_home::foreign_sessions_root() else {
+        return false;
+    };
+    let encoded = crate::util::grok_home::encode_cwd_dirname(cwd);
+    let foreign_path = foreign_root.join(&encoded).join(session_id);
+    if !is_persisted_session_dir(&foreign_path) {
+        return false;
+    }
+    let local_root = crate::util::grok_home::grok_home().join("sessions");
+    copy_foreign_session_to_local(session_id, &encoded, &foreign_path, &local_root).is_ok()
+}
+
+/// Copy a foreign session directory into the local sessions root.
+fn copy_foreign_session_to_local(
+    session_id: &str,
+    cwd_dir_name: &str,
+    foreign_path: &Path,
+    local_sessions_root: &Path,
+) -> io::Result<PathBuf> {
+    let local_path = local_sessions_root.join(cwd_dir_name).join(session_id);
+    if local_path.exists() {
+        return Ok(local_path);
+    }
+    std::fs::create_dir_all(&local_path)?;
+    copy_dir_recursive(foreign_path, &local_path)?;
+    tracing::info!(
+        session_id,
+        from = %foreign_path.display(),
+        to = %local_path.display(),
+        "copied foreign session for resume"
+    );
+    Ok(local_path)
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn find_any_session_dir_by_id_result(session_id: &str) -> io::Result<Option<PathBuf>> {
@@ -2814,6 +2914,8 @@ pub(crate) async fn load_light(
 
 /// List session summaries, optionally filtered by cwd (absolute path string).
 /// Returns summaries sorted by `last_active_at` (else `updated_at`) descending.
+/// Also scans the foreign sessions root (`~/.grok/sessions`) for cross-build
+/// resume; foreign sessions are deduped by id (local wins).
 fn recover_session_relocations_in(root: &Path) -> crate::session::storage::relocation::Result<()> {
     crate::session::storage::relocation::RelocationStorage::new(root.into()).recover_all()
 }
@@ -2826,7 +2928,26 @@ pub async fn list_summaries(cwd: Option<&str>) -> io::Result<Vec<Summary>> {
         .map_err(io::Error::other)?
         .map_err(io::Error::other)?;
     let storage: Box<dyn StorageAdapter> = Box::new(JsonlStorageAdapter::with_root(root_dir));
-    storage.list_sessions(cwd).await
+    let mut summaries = storage.list_sessions(cwd).await?;
+
+    if let Some(foreign_sessions) = crate::util::grok_home::foreign_sessions_root() {
+        if let Some(foreign_home) = foreign_sessions.parent() {
+            let foreign_storage: Box<dyn StorageAdapter> =
+                Box::new(JsonlStorageAdapter::with_root(foreign_home.to_path_buf()));
+            if let Ok(foreign_summaries) = foreign_storage.list_sessions(cwd).await {
+                let local_ids: std::collections::HashSet<String> =
+                    summaries.iter().map(|s| s.info.id.0.to_string()).collect();
+                for fs in foreign_summaries {
+                    let id = fs.info.id.0.to_string();
+                    if !local_ids.contains(&id) {
+                        summaries.push(fs);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(summaries)
 }
 
 /// Failure modes of [`delete_session_history`].
