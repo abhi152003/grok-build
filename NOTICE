@@ -1,0 +1,43 @@
+abxglia-grok — NOTICE
+================================================================================
+
+This is a derivative work based on grok-build by SpaceXAI
+(https://github.com/xai-org/grok-build), licensed under the Apache License,
+Version 2.0.
+
+The following files have been modified from the original upstream source
+(Apache License, Version 2.0, §4(b) change notice):
+
+  crates/codegen/xai-grok-config/src/lib.rs
+  crates/codegen/xai-grok-config/src/paths.rs
+  crates/codegen/xai-grok-pager/Cargo.toml
+  crates/codegen/xai-grok-pager/src/acp/tracker.rs
+  crates/codegen/xai-grok-pager/src/app/acp_handler/permissions.rs
+  crates/codegen/xai-grok-pager/src/app/app_view.rs
+  crates/codegen/xai-grok-pager/src/app/cli.rs
+  crates/codegen/xai-grok-pager/src/app/dispatch/permissions.rs
+  crates/codegen/xai-grok-pager/src/app/event_loop.rs
+  crates/codegen/xai-grok-pager/src/app/mod.rs
+  crates/codegen/xai-grok-pager-bin/Cargo.toml
+  crates/codegen/xai-grok-shared/src/ui_config.rs
+  crates/codegen/xai-grok-shell-base/src/util/grok_home.rs
+  crates/codegen/xai-grok-shell/src/session/persistence.rs
+  crates/codegen/xai-grok-pager/src/completions_cmd.rs
+
+The following files are original additions (Apache License, Version 2.0):
+
+  crates/codegen/xai-grok-pager/src/app/diff_review.rs
+  cursor-close-diff/src/extension.js
+  cursor-close-diff/package.json
+
+Modifications summary:
+  - Renamed the build artifact from "xai-grok-pager" to "abxglia-grok"
+  - Added editor diff review (opens diffs in VS Code/Cursor via a socket bridge)
+  - Added inline diff suppression when editor review is active
+  - Added one-way cross-home session sharing (resume grok sessions in abxglia-grok)
+
+Original copyright notice retained:
+
+  Copyright 2023-2026 SpaceXAI
+
+See LICENSE for the full Apache License, Version 2.0 text.

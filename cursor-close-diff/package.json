@@ -4,6 +4,7 @@
   "description": "Socket-based diff bridge for abxglia-grok: opens diffs with real file names in the correct Cursor window, auto-closes on permission resolve.",
   "version": "0.2.3",
   "publisher": "abxglia",
+  "license": "Apache-2.0",
   "engines": {
     "vscode": "^1.87.0"
   },

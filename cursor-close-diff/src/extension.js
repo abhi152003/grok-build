@@ -1,3 +1,6 @@
+// Copyright 2026 abhi152003. Licensed under the Apache License, Version 2.0.
+// See ../LICENSE and ../NOTICE for details.
+
 const vscode = require('vscode');
 const path = require('path');
 const os = require('os');

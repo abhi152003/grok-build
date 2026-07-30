@@ -1,3 +1,11 @@
+> **Fork notice**: This is a personal fork of
+> [xai-org/grok-build](https://github.com/xai-org/grok-build) (Apache-2.0)
+> with additional features: editor-based diff review (VS Code/Cursor), inline
+> diff suppression, and cross-build session sharing. It builds as
+> `abxglia-grok` and runs fully isolated from the released `grok`.
+> See [`cursor-close-diff/README.md`](cursor-close-diff/README.md) for setup,
+> and [`NOTICE`](NOTICE) for modification notices (Apache §4(b)).
+
 <div align="center">
 
 <h1>
