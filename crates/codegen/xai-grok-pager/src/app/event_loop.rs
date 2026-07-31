@@ -554,13 +554,14 @@ fn run_pending_suspends(
 ) -> anyhow::Result<()> {
     let editor_pending = app.pending_editor.is_some();
     let pager_pending = app.pending_pager_path.is_some();
+    let diff_pending = app.pending_editor_diff.is_some();
     suspend_wait_reports.reset_missing(editor_pending, pager_pending);
     if !suspend_retry_ready(*suspend_retry_after, Instant::now()) {
         return Ok(());
     }
     // The gate is consumed before any blocking park/drain attempt. A timeout
     // must arm a fresh deadline before this function returns.
-    if !editor_pending && !pager_pending {
+    if !editor_pending && !pager_pending && !diff_pending {
         *suspend_retry_after = None;
         return Ok(());
     }

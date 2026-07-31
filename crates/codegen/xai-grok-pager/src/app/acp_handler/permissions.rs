@@ -86,8 +86,7 @@ pub(super) fn handle_permission_request(
     //    Redraw is only needed when the owning agent is currently visible.
 
     // 4a. Editor diff review: arm the diff if this is an edit and the user
-    //     opted in via `[ui] diff_review_editor`. The prompt-title annotation
-    //     is added later in the event loop after `run()` confirms the diff opened.
+    //     opted in via `[ui] diff_review_editor`.
     if is_edit_permission(&perm.request)
         && let Some(setting) = app.current_ui.diff_review_editor.as_deref()
         && let Some(mode) = crate::app::diff_review::ReviewMode::from_setting(setting)

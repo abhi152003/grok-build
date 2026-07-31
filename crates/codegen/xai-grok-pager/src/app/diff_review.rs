@@ -299,8 +299,12 @@ impl PendingEditorDiff {
                 if let Some(instance) = find_instance_for_cwd(&self.cwd) {
                     let old_text = std::fs::read_to_string(old_path).unwrap_or_default();
                     let new_text = std::fs::read_to_string(new_path).unwrap_or_default();
-                    if send_diff_via_socket(&instance.socket_path, &self.file_path, &old_text, &new_text)
-                    {
+                    if send_diff_via_socket(
+                        &instance.socket_path,
+                        &self.file_path,
+                        &old_text,
+                        &new_text,
+                    ) {
                         return true;
                     }
                 }
