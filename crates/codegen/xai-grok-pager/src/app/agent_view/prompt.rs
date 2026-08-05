@@ -116,6 +116,13 @@ impl AgentView {
         // dropdown state derived from that text would otherwise steal the
         // arrows mid-browse.
         if self.prompt.history_search.is_active() {
+            // Tear down the history overlay before opening the cheatsheet: it
+            // renders unconditionally and would bleed around the popup, and Esc
+            // would otherwise silently resume the browse instead of closing help.
+            if registry.matches_id(ActionId::ShortcutsHelp, key) {
+                self.close_history_restoring_saved();
+                return self.handle_agent_action_with_registry(ActionId::ShortcutsHelp, registry);
+            }
             return self.handle_history_search_key(key);
         }
 
@@ -616,6 +623,11 @@ impl AgentView {
                     return InputOutcome::Changed;
                 }
                 ActionId::InterjectPrompt => {
+                    crate::actions::log_shortcut_used(
+                        key,
+                        ActionId::InterjectPrompt,
+                        When::PromptFocused.telemetry_name(),
+                    );
                     // Editing-queued intercept lives in `queue_edit.rs`.
                     if let Some(outcome) = self.interject_editing_queued_intercept() {
                         return outcome;

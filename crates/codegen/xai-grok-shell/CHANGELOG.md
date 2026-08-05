@@ -1,5 +1,114 @@
 # Changelog
 
+# 0.2.120 — 2026-08-03
+
+## Bug Fixes
+
+- **Model picker** now updates the status bar and /model menu immediately, even before the first prompt creates a session.
+- **Changes panel** now refreshes after the agent commits on the current branch instead of showing stale unstaged files.
+- **Background task** completions now report the full log size and read hint even when only a short prefix was captured.
+- **GitHub export** on old hibernated sessions now shows a clear message to start a new chat instead of a generic error.
+
+
+# 0.2.119 — 2026-08-02
+
+## Features
+
+- **Always allow** for bash commands now lets you edit a free-form glob pattern instead of only word-prefix scopes.
+- **Long responses** now show a clickable arrow that jumps back to the start of the answer.
+- **Auto mode** now auto-approves more common read-only git commands and harmless file appends.
+- **Plan previews** now show Mermaid diagram buttons (Open Image, Copy Image Path, Copy Source).
+
+## Bug Fixes
+
+- **Gateway connections** now detect and recover from dead sockets more reliably.
+- **Question cards** now let you Tab through answers instead of losing focus to the scrollback.
+- **Resume picker** no longer tries to load a session from pasted garbage when you press Enter.
+- **Background task** completion messages no longer grow unbounded when the task produced a huge log.
+- **Plan viewer scrollbar** now responds to clicks on the border column and renders without dark stripes in Terminal.app.
+- **Expired external auth provider** credentials now correctly trigger the interactive sign-in flow instead of a silent 401 loop.
+
+## Performance
+
+- **/btw** side questions now reuse the parent session’s cached prefix for faster responses.
+- **Doctor** and tmux-backed startup are now faster when no live tmux processes remain.
+
+
+# 0.2.118 — 2026-07-31
+
+## Features
+
+- **Sessions** can now be permanently deleted from the dashboard by pressing Ctrl+X twice on an idle row, or from the welcome list with d then y.
+- **Keyboard shortcuts help** (Ctrl+.) now shows how to browse prompt history and search the conversation.
+- **grok doctor** now warns when tmux is reducing colors and can fix the config.
+
+## Bug Fixes
+
+- **`/btw`** now retries on temporary model overload instead of failing immediately.
+- **Session sharing** is temporarily disabled.
+- **`[stop]`** / Ctrl+C during `/compact` now cancels instead of no-opping.
+- **Automatic recaps** no longer appear twice after the same turn.
+- **Background task wait timeout** descriptions and limits now match the client's actual configured ceiling.
+- **Background tasks** no longer stay stuck as 'Running' in the tasks pane when they finish quickly.
+- **Plan mode indicator** now disappears right after approving a plan instead of lingering.
+- **Dragging the scrollbar** in the plan preview now works as expected.
+- **Compaction** now correctly handles certain context-length errors from the inference API.
+
+
+# 0.2.117 — 2026-07-30
+
+## Features
+
+- **GROK_EXTRA_CA_BUNDLE** env var allows adding custom TLS root certificates.
+
+## Bug Fixes
+
+- **Stop command** now terminates all background subagents from prior turns.
+- **kill_task** tool now correctly reports when a task does not exist over ACP connections.
+- **get_task_output** no longer waits the full timeout for already-finished tasks over ACP.
+- **/usage** command and billing UI are hidden for enterprise auth setups.
+- **Plan approval** no longer starts Build when pressing Enter without notes in revise mode.
+
+## Performance
+
+- **Terminal resize** is much faster on long conversations in fullscreen mode.
+
+
+# 0.2.116 — 2026-07-30
+
+## Features
+
+- **Headless streaming output** now includes tool calls, results, and usage when using `--output-format streaming-json`.
+- **New `/undo` slash command** restores files and chat to an earlier turn, same as `/rewind`.
+- **Slash commands** are now correctly hidden or refused in minimal or fullscreen mode based on their declared support.
+
+## Bug Fixes
+
+- **Fixed repeated forced re-logins** after laptop sleep or network hiccups during token refresh.
+- **Suppressed spurious history load warnings** on draft conversations that have no server history yet.
+- **Settings enum pickers** now keep the selected radio button on the current value until you press Enter.
+- **Deep-linked settings** such as `/privacy` now close the settings modal on Esc or Enter instead of returning to the list.
+
+
+# 0.2.115 — 2026-07-29
+
+## Features
+
+- **Delete sessions from the dashboard and welcome list.** On the dashboard, press `Ctrl+X` twice (or hover a settled row and click `[✗]` twice); in the welcome and `/resume` lists, press `d` then `y`.
+
+## Bug Fixes
+
+- **Fixed chat history corruption** that could duplicate tool results or cause later 400 errors after repeated identical tool calls.
+- **Fixed infinite redirect loops** in embedded previews when the browser blocks the required cookie.
+- **Improved the action-stationarity nudge message** to avoid incorrectly claiming tool results were identical.
+- **Fixed external auth provider commands** (`auth_provider_command`) not working on Windows.
+- **Fixed incorrect 'Turn cancelled by user' messages** shown on internal send-now wake turns.
+- **Fixed language server crashes** (e.g. Roslyn on every edit) and missing C# diagnostics; improved diagnostics reliability for other servers.
+
+## Performance
+
+- **Improved prompt caching** for long conversations, reducing repeated billing on growing transcripts.
+
 # 0.2.114 — 2026-07-29
 
 ## Features

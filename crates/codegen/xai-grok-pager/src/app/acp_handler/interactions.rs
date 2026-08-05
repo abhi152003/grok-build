@@ -56,7 +56,7 @@ pub(crate) fn handle_ask_user_question(
 
     // If a question is already active, cancel it before replacing.
     if let Some(mut old_qv) = agent.question_view.take() {
-        agent.turn_paused_duration += old_qv.opened_at.elapsed();
+        agent.record_question_pause(&old_qv);
         tracing::warn!(
             old_tool_call_id = %old_qv.tool_call_id,
             new_tool_call_id = %ext_req.tool_call_id,
@@ -83,7 +83,6 @@ pub(crate) fn handle_ask_user_question(
                 LocalQuestionKind::CreditLimitUpsell { .. } => "credit-limit upsell",
                 LocalQuestionKind::FreeUsageUpsell { .. } => "SuperGrok upsell",
                 LocalQuestionKind::AgentTypeMismatch { .. } => "model switch",
-                LocalQuestionKind::ProjectSelect { .. } => "project select",
                 LocalQuestionKind::DoctorFix { .. } => "/doctor fix",
                 LocalQuestionKind::DeleteCurrentSession => "/delete",
             };

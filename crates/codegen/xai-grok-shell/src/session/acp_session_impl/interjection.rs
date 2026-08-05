@@ -243,8 +243,7 @@ impl SessionActor {
         if !text.trim_start().starts_with('/') {
             return None;
         }
-        let bridge = self.agent.borrow().tool_bridge().clone();
-        let slash_skills = bridge.slash_skills().await;
+        let slash_skills = self.slash_skills_for_resolve().await;
         // Availability without `command_availability()`'s goal-reconciliation
         // side effects — this runs mid-turn inside the drain.
         let tool_names = self.registered_tool_names().await;
@@ -266,6 +265,7 @@ impl SessionActor {
                 xai_grok_telemetry::events::SkillDispatched {
                     skill_name: sk.name.clone(),
                     plugin_source: sk.plugin_name.clone(),
+                    trigger: xai_grok_telemetry::events::SkillTrigger::SlashCommand,
                 },
             );
         }

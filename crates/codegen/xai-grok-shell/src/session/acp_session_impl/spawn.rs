@@ -1,5 +1,10 @@
 //! Session bring-up concern for `acp_session`: `spawn_session_actor`, the
 //! per-session OS thread (`SessionThread` / `spawn_session_on_thread`), and
+//!
+//! Chat+local `own` supervisor (`gateway_bridge::local_workspace_supervisor`) is
+//! started in `session/new` *before* handshake stamp and stored on `MvpAgent`
+//! (not `SessionActor`). Crash-restart issues
+//! `BridgeCommand::UpdateComputerSessions` through the bridge slot seeded here.
 //! the MCP auto-restart wiring (`SessionRestartActions`).
 #![allow(clippy::items_after_test_module)]
 use super::*;
@@ -307,6 +312,7 @@ pub(crate) async fn spawn_session_actor(
     >,
     max_turns: Option<usize>,
     forked_tool_override: Option<Vec<ToolSpec>>,
+    is_chat_kind: bool,
 ) -> Result<
     (
         SessionHandle,
@@ -443,6 +449,9 @@ pub(crate) async fn spawn_session_actor(
         .filter(|item| matches!(item, ConversationItem::User(_)))
         .count();
     let initial_conversation_len = conversation.len();
+    let initial_last_recap_main_turn = crate::session::helpers::session_recap::load_recap_watermark(
+        &crate::session::persistence::session_dir(&session_info),
+    );
     let initial_user_count = initial_prompt_index.saturating_sub(1) as u32;
     let initial_assistant_count = conversation
         .iter()
@@ -1546,6 +1555,7 @@ pub(crate) async fn spawn_session_actor(
         model_auth_memo: std::cell::RefCell::new(None),
         attribution_callback,
         auth_manager,
+        is_chat_kind,
         state,
         notifications: NotificationSender {
             gateway: gateway.clone(),
@@ -1586,6 +1596,7 @@ pub(crate) async fn spawn_session_actor(
             tool_choice: compaction_tool_choice,
             prefire: crate::session::compaction_config::PrefireState::default(),
             prefix_released: std::sync::atomic::AtomicBool::new(false),
+            cancel: Default::default(),
         },
         memory: super::memory_state::SessionMemory {
             flush_config: memory_config.as_ref().map_or_else(
@@ -1742,7 +1753,7 @@ pub(crate) async fn spawn_session_actor(
         ),
         observability_bridge: obs_bridge,
         current_turn_number: std::cell::Cell::new(0),
-        last_recap_main_turn: std::cell::Cell::new(0),
+        last_recap_main_turn: std::cell::Cell::new(initial_last_recap_main_turn),
         recap_in_flight: std::cell::Cell::new(false),
         recap_epoch: std::cell::Cell::new(0),
         session_turn_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2257,6 +2268,7 @@ pub(crate) async fn spawn_session_on_thread(
     >,
     max_turns: Option<usize>,
     forked_tool_override: Option<Vec<ToolSpec>>,
+    is_chat_kind: bool,
 ) -> Result<
     (
         SessionHandle,
@@ -2425,6 +2437,7 @@ pub(crate) async fn spawn_session_on_thread(
                         parent_scheduler_handle,
                         max_turns,
                         forked_tool_override,
+                        is_chat_kind,
                     )
                     .await
                     {
