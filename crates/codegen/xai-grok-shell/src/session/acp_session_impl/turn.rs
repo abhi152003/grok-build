@@ -130,7 +130,7 @@ enum UserEchoMode {
     PersistOnly,
 }
 fn user_echo_mode(prompt_id: &str) -> UserEchoMode {
-    if prompt_id.starts_with(super::interjection::INTERJECT_FALLBACK_PROMPT_PREFIX) {
+    if super::interjection::is_interject_fallback(prompt_id) {
         return UserEchoMode::PersistOnly;
     }
     match super::super::PromptOrigin::from_prompt_id(prompt_id) {
@@ -248,6 +248,7 @@ impl SessionActor {
         prompt_client_identifier: Option<String>,
         prompt_screen_mode: Option<String>,
         verbatim: bool,
+        send_now: bool,
         json_schema: Option<serde_json::Value>,
         persist_ack: Option<oneshot::Sender<()>>,
         parsed_prompt_tx: Option<oneshot::Sender<ParsedPromptInfo>>,
@@ -278,12 +279,13 @@ impl SessionActor {
             }
         }
         if !origin.is_synthetic() {
-            self.cancel_pending_recap_for_new_prompt();
+            self.invalidate_side_calls_for_new_prompt();
         }
+        self.ensure_session_disk_writable().await?;
+        self.signals_handle().increment_turn();
+        let prompt_mode = self.resolve_turn_prompt_mode(&origin, prompt_mode);
         *self.turn_start_prompt_mode.lock() = prompt_mode;
         *self.turn_prompt_mode.lock() = prompt_mode;
-        self.signals_handle().increment_turn();
-        self.reconcile_plan_mode_with_prompt(prompt_mode);
         let _turn_active_guard =
             TurnActiveGuard::activate(self.tool_context.is_turn_active.as_ref());
         let _session_turn_active_guard = TurnActiveGuard::activate(Some(&self.session_turn_active));
@@ -374,6 +376,7 @@ impl SessionActor {
                             }
                             GoalResumeOutcome::Message(msg) => {
                                 self.persist_host_turn_user_echo(&original_prompt_text, prompt_id);
+                                self.mark_front_message_committed().await;
                                 self.send_host_turn_slash_command_output(&msg).await;
                                 return ok_end_turn(0, None);
                             }
@@ -381,6 +384,7 @@ impl SessionActor {
                     }
                     BuiltinAction::WorkflowLaunch { name, input } => {
                         self.persist_host_turn_user_echo(&original_prompt_text, prompt_id);
+                        self.mark_front_message_committed().await;
                         let msg = self
                             .launch_named_workflow(&workflow_registry, &name, &input)
                             .await;
@@ -596,6 +600,11 @@ impl SessionActor {
             );
         }
         let query = crate::session::placeholder_images::strip_paths_from_image_placeholders(query);
+        let query = if send_now && !verbatim {
+            format!("{}\n{query}", xai_interjection_core::INTERJECTION_NOTE)
+        } else {
+            query
+        };
         let user_images = self
             .normalize_images_with_notices(&mut context, raw_images, is_cursor)
             .await;
@@ -708,11 +717,15 @@ impl SessionActor {
             self.transcribe_user_images(user_message, &user_images)
                 .await?
         } else {
-            let session_dir =
-                crate::session::persistence::session_dir(&crate::session::info::Info {
+            let session_dir = crate::session::persistence::ensure_owner_only_session_dir(
+                &crate::session::info::Info {
                     id: self.session_info.id.clone(),
                     cwd: self.session_info.cwd.clone(),
-                });
+                },
+            )
+            .map_err(|e| {
+                acp::Error::internal_error().data(format!("failed to create session dir: {e}"))
+            })?;
             crate::session::image_describe::persist_and_prepend_image_files(
                 &session_dir,
                 &user_images,
@@ -793,6 +806,7 @@ impl SessionActor {
                     .await
                     .is_some()
                 {
+                    self.mark_front_message_committed().await;
                     let (flush_tx, flush_rx) = oneshot::channel();
                     if self
                         .notifications
@@ -801,7 +815,7 @@ impl SessionActor {
                             respond_to: flush_tx,
                         })
                         .is_ok()
-                        && flush_rx.await.is_ok()
+                        && matches!(flush_rx.await, Ok(Ok(())))
                     {
                         let _ = ack.send(());
                     } else {
@@ -820,6 +834,7 @@ impl SessionActor {
                 }
             } else {
                 self.chat_state_handle.push_user_message(user_chat);
+                self.mark_front_message_committed().await;
             }
         }
         self.dispatch_hook(
@@ -837,7 +852,7 @@ impl SessionActor {
         let turn_model_id = self.current_model_id().await;
         let doom_event_model = turn_model_id.clone();
         let turn_timer = std::time::Instant::now();
-        let result = {
+        let mut result = {
             let mut round_trace = trace_gcs_config;
             let mut round_artifact = artifact_tracker;
             let mut stop_continuations_this_turn: u32 = 0;
@@ -901,6 +916,37 @@ impl SessionActor {
                 }
             }
         };
+        if matches!(
+            result,
+            Ok(TurnOutcome::Cancelled { .. }) | Ok(TurnOutcome::MaxTurnsReached { .. })
+        ) {
+            self.cancel_running_turn_subagents(prompt_id);
+        }
+        let mut flush_error = self.flush_to_disk().await.err();
+        self.file_state_tracker
+            .end_prompt(&self.tool_context.fs, current_prompt_index)
+            .await;
+        if let Some(mut rewind_point) = self
+            .file_state_tracker
+            .get_rewind_point(current_prompt_index)
+            .await
+        {
+            rewind_point.normalize_to_relative(self.tool_context.cwd.as_ref());
+            let _ = self
+                .notifications
+                .persistence_tx
+                .send(PersistenceMsg::RewindPoint(rewind_point));
+            if flush_error.is_none() {
+                flush_error = self.flush_to_disk().await.err();
+            }
+        }
+        if matches!(
+            &result,
+            Ok(TurnOutcome::Completed { .. }) | Ok(TurnOutcome::StationarityEnded { .. })
+        ) && let Err(error) = self.disk_full_acp_error(flush_error.as_ref())
+        {
+            result = Err(error);
+        }
         let turn_duration_ms = turn_timer.elapsed().as_millis() as u64;
         let handle_prompt_elapsed_ms = handle_prompt_start.elapsed().as_millis() as u64;
         xai_grok_telemetry::unified_log::info(
@@ -1150,31 +1196,10 @@ impl SessionActor {
                 }
             }
         }
-        if matches!(
-            result,
-            Ok(TurnOutcome::Cancelled { .. }) | Ok(TurnOutcome::MaxTurnsReached { .. })
-        ) {
-            self.cancel_running_turn_subagents(prompt_id);
-        }
-        self.flush_to_disk().await;
-        self.file_state_tracker
-            .end_prompt(&self.tool_context.fs, current_prompt_index)
-            .await;
-        if let Some(mut rewind_point) = self
-            .file_state_tracker
-            .get_rewind_point(current_prompt_index)
-            .await
-        {
-            rewind_point.normalize_to_relative(self.tool_context.cwd.as_ref());
-            let _ = self
-                .notifications
-                .persistence_tx
-                .send(PersistenceMsg::RewindPoint(rewind_point));
-        }
+        let usage = self.freeze_prompt_usage(prompt_id).await;
+        drop(turn_scope_guard);
         match result {
             Ok(outcome) => {
-                let usage = self.freeze_prompt_usage(prompt_id).await;
-                drop(turn_scope_guard);
                 self.chat_state_handle.flush();
                 let total_tokens = self.chat_state_handle.get_total_tokens().await;
                 let (stop_reason, mut snapshot, completion_kind, structured_output) = match outcome
@@ -1232,11 +1257,7 @@ impl SessionActor {
                     tool_overrides: None,
                 })
             }
-            Err(e) => {
-                let usage = self.freeze_prompt_usage(prompt_id).await;
-                drop(turn_scope_guard);
-                Err(crate::sampling::error::attach_prompt_usage(e, usage))
-            }
+            Err(e) => Err(crate::sampling::error::attach_prompt_usage(e, usage)),
         }
     }
     /// Wait for turn-blocking subagents (up to 120s on the turn task),
@@ -2422,7 +2443,7 @@ impl SessionActor {
                     turn_index,
                     mcp_count,
                     mcp_tools,
-                    self.mcp_strategy,
+                    self.mcp_strategy.get(),
                     self.current_model_id().await,
                 );
             }

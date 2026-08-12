@@ -1,6 +1,6 @@
 [package]
 name = "xai-grok-pager"
-version = "0.2.120"
+version = "1.0.1"
 edition.workspace = true
 license = "Apache-2.0"
 authors = ["xAI"]
@@ -12,6 +12,8 @@ xai-tty-utils = { workspace = true }
 xai-grok-version = { workspace = true }
 # Editor diff-review feature (PendingEditorDiff temp files). Also used by tests.
 tempfile = { workspace = true }
+# Cap the GUI `code`/`cursor --diff` spawn so a hung editor cannot block the TUI.
+wait-timeout = { workspace = true }
 
 # Shared prompt-queue wire types
 xai-prompt-queue = { workspace = true }
@@ -111,7 +113,7 @@ xai-grok-tools = { workspace = true }
 xai-grok-agent = { workspace = true }
 xai-grok-plugin-marketplace = { path = "../xai-grok-plugin-marketplace" }
 xai-hooks-plugins-types = { path = "../xai-hooks-plugins-types" }
-wait-timeout = { workspace = true }
+walkdir = { workspace = true }
 xai-grok-sandbox = { path = "../xai-grok-sandbox", default-features = false }
 
 # Base64 encoding for image data

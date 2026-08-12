@@ -7,9 +7,9 @@ use super::{
 use crate::app::app_view::InputOutcome;
 use crate::scrollback::table_geometry::{CellRef, TableGeometry};
 use crate::scrollback::text_selection::{
-    ActiveBlockDrag, ActiveTextDrag, AutoScrollDirection, PendingBlockDrag, PendingTextDrag,
-    PersistentTextSelection, RangeHit, ResolvedSelectionModel, SelectionEndpoint, SelectionKind,
-    SelectionOrigin, TableSelectionGeometry, apply_selection_boundary,
+    ActiveBlockDrag, ActiveTextDrag, AutoScrollDirection, DragAutoScrollState, PendingBlockDrag,
+    PendingTextDrag, PersistentTextSelection, RangeHit, ResolvedSelectionModel, SelectionEndpoint,
+    SelectionKind, SelectionOrigin, TableSelectionGeometry, apply_selection_boundary,
     block_drag_threshold_exceeded, compute_autoscroll, configured_word_separators,
     drag_threshold_exceeded, reconstruct_full_selection_text_with_boundaries,
     reconstruct_selection_text, reconstruct_selection_text_with_boundaries,
@@ -18,6 +18,7 @@ use crate::scrollback::text_selection::{
 };
 use crate::views::btw_overlay::BTW_OVERLAY_ENTRY_IDX;
 use crossterm::event::MouseEvent;
+use ratatui::layout::Rect;
 use std::time::{Duration, Instant};
 
 /// Two fold/nav double-clicks on assistant text within this window count as a
@@ -299,6 +300,51 @@ impl AgentView {
         self.last_drag_mouse = None;
     }
 
+    /// Finish a latched gesture whose `Up(Left)` was lost, as that release
+    /// would have: an active text/block drag delivers its copy (unlike
+    /// [`Self::clear_stuck_scrollback_drag`], which discards the gesture).
+    /// A sub-threshold press just drops its latches: a synthesized release
+    /// must not fabricate a click or leave click/link arms dangling.
+    pub(super) fn finish_stuck_drag_as_lost_up(&mut self) {
+        self.left_mouse_down = false;
+        self.scrollbar_dragging = false;
+        self.deferred_text_press = None;
+        self.pending_scrollback_click = None;
+        self.pending_link_click = None;
+        if self.drag_selection.is_some() {
+            self.finish_text_drag();
+        } else if self.block_drag_selection.is_some() {
+            self.finish_block_drag();
+        }
+        self.pending_text_drag = None;
+        self.pending_block_drag = None;
+        self.drag_autoscroll = None;
+        self.last_drag_mouse = None;
+    }
+
+    /// On xterm.js embeds a lost release can also mean the terminal's own
+    /// button tracker is wedged and will eat every release from now on
+    /// (VS Code after a context-menu gesture). Toggling reporting off and on
+    /// resets the tracker so the next gesture gets clean reports. Callers
+    /// must know the button is UP (bare `Moved`, an unpaired release): the
+    /// toggle clears xterm.js's tracking of a press in flight, so firing it
+    /// mid-press would break that gesture. Gated to xterm.js embeds: other
+    /// terminals don't have the wedge, and some (VTE) emit spurious events
+    /// on mouse-mode churn.
+    pub(super) fn reset_wedged_mouse_reporting(&self) {
+        if crate::terminal::terminal_context().brand.is_xtermjs_embed()
+            && crate::app::MOUSE_CAPTURE_ENABLED.load(std::sync::atomic::Ordering::Acquire)
+        {
+            xai_grok_shell::util::with_locked_stderr(|stderr| {
+                let _ = crossterm::execute!(
+                    stderr,
+                    crossterm::event::DisableMouseCapture,
+                    crossterm::event::EnableMouseCapture
+                );
+            });
+        }
+    }
+
     /// Update [`Self::plan_prompt_mouse_drag`] for a left-button mouse event
     /// during plan feedback and report whether the event should be forwarded
     /// to the feedback prompt (for cursor placement / text selection).
@@ -512,7 +558,7 @@ impl AgentView {
         self.drag_autoscroll = if is_btw {
             None
         } else {
-            compute_autoscroll(mouse.row, self.pane_areas.scrollback)
+            self.drag_autoscroll_for(mouse.row)
         };
         changed
     }
@@ -783,8 +829,45 @@ impl AgentView {
         let changed = new_head != drag.head_entry_idx;
         drag.head_entry_idx = new_head;
         self.last_drag_mouse = Some((mouse.column, mouse.row));
-        self.drag_autoscroll = compute_autoscroll(mouse.row, self.pane_areas.scrollback);
+        self.drag_autoscroll = self.drag_autoscroll_for(mouse.row);
         changed
+    }
+
+    /// Autoscroll for a drag pointer at `row`, measured from the first content row: a pinned sticky header is fixed chrome and never a scroll gutter.
+    fn drag_autoscroll_for(&self, row: u16) -> Option<DragAutoScrollState> {
+        let pane = self.pane_areas.scrollback;
+        let content = self.last_scrollback_selection_model.content_area;
+        let pane_bottom = pane.y.saturating_add(pane.height);
+
+        // Header-only viewport: the pane publishes a zero-height content rect at the header's end. All chrome,
+        // nothing to scroll toward. An unset rect (no frame yet) falls back to the pane-wide zone instead.
+        if content.height == 0 {
+            let header_only = content.y > pane.y && content.y < pane_bottom;
+            return if header_only {
+                None
+            } else {
+                compute_autoscroll(row, pane)
+            };
+        }
+
+        // A content rect outside this pane belongs to another layout; use the pane-wide zone.
+        if content.y < pane.y || content.y >= pane_bottom {
+            return compute_autoscroll(row, pane);
+        }
+
+        // Header rows above the content are inert chrome.
+        if (pane.y..content.y).contains(&row) {
+            return None;
+        }
+
+        compute_autoscroll(
+            row,
+            Rect {
+                y: content.y,
+                height: pane_bottom - content.y,
+                ..pane
+            },
+        )
     }
 
     pub(in crate::app) fn finish_block_drag(&mut self) -> bool {
@@ -2830,6 +2913,69 @@ mod tests {
             prev = now;
         }
         assert_eq!(prev, 0, "held at the top clamp");
+    }
+
+    /// A drag selecting text in the pinned header must not arm scroll-up.
+    #[test]
+    fn autoscroll_zone_starts_below_the_sticky_header() {
+        let mut agent = agent_with_tall_scrollback();
+        // A 4-row sticky header: content starts at pane row 4.
+        agent.last_scrollback_selection_model.content_area = Rect::new(0, 4, 80, 6);
+
+        // Header rows are inert.
+        for row in [0u16, 1, 2, 3] {
+            assert!(
+                agent.drag_autoscroll_for(row).is_none(),
+                "row {row} is sticky-header chrome and must not autoscroll"
+            );
+        }
+        // The content's own top rows still do.
+        assert_eq!(
+            agent.drag_autoscroll_for(4).map(|a| a.direction),
+            Some(AutoScrollDirection::Up)
+        );
+        // The bottom edge is still the pane's.
+        assert_eq!(
+            agent.drag_autoscroll_for(9).map(|a| a.direction),
+            Some(AutoScrollDirection::Down)
+        );
+    }
+
+    /// Without a header (compact mode, scrolled to the top) the zone is the pane.
+    #[test]
+    fn autoscroll_zone_falls_back_to_the_pane_without_a_header() {
+        let mut agent = agent_with_tall_scrollback();
+        agent.last_scrollback_selection_model.content_area = Rect::new(0, 0, 80, 10);
+        assert_eq!(
+            agent.drag_autoscroll_for(0).map(|a| a.direction),
+            Some(AutoScrollDirection::Up)
+        );
+
+        // An unpopulated model falls back rather than disabling autoscroll.
+        agent.last_scrollback_selection_model.content_area = Rect::default();
+        assert_eq!(
+            agent.drag_autoscroll_for(0).map(|a| a.direction),
+            Some(AutoScrollDirection::Up)
+        );
+        assert_eq!(
+            agent.drag_autoscroll_for(9).map(|a| a.direction),
+            Some(AutoScrollDirection::Down)
+        );
+    }
+
+    /// A frame whose rows are all header chrome (a sticky header filling a short pane) must not arm autoscroll
+    /// anywhere. The pane publishes the zero-height content rect at the header's end.
+    #[test]
+    fn autoscroll_stays_off_in_a_header_only_viewport() {
+        let mut agent = agent_with_tall_scrollback();
+        agent.last_scrollback_selection_model.content_area = Rect::new(0, 9, 80, 0);
+
+        for row in [0u16, 5, 9] {
+            assert!(
+                agent.drag_autoscroll_for(row).is_none(),
+                "row {row} is header chrome in a header-only viewport and must not autoscroll"
+            );
+        }
     }
 
     /// The strip conversion landing on the bottommost text row (inside the

@@ -4,7 +4,7 @@
 //!
 //! These structs were extracted from `xai-grok-shell` so they can be
 //! reused across binaries (TUI, sampler) without dragging the shell HTTP /
-//! Mixpanel client along. The `CompactionScope` helper that drives paired
+//! product-analytics client along. The `CompactionScope` helper that drives paired
 //! `compaction_triggered`/`compaction_completed` emission stays in shell --
 //! it calls `super::log_event` directly.
 
@@ -12,6 +12,9 @@ use serde::Serialize;
 
 use super::enums::PermissionMode;
 pub use super::enums::PrCreationSource;
+
+mod permission_analytics;
+pub use permission_analytics::*;
 
 /// Binds a product event name to a struct. Implement via `telemetry_event!` below.
 pub trait TelemetryEvent: Serialize + Send + 'static {
@@ -103,6 +106,94 @@ pub enum AccessKind {
     Grep,
     Mcp,
     Web,
+}
+
+/// Outcome of one CLI binary install/update attempt.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CliUpdateOutcome {
+    Success,
+    Failed,
+}
+
+/// Why a CLI binary install/update failed. Smoke kinds are post-download
+/// `--version` checks; other kinds cover download/activation/misc errors.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CliUpdateErrorKind {
+    SmokeTimeout,
+    SmokeNonzero,
+    SmokeSpawn,
+    Download,
+    Activate,
+    Other,
+}
+
+/// Installer that performed the attempt. Wire values match the persisted
+/// installer strings; `Other` bounds unknown persisted values.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CliUpdateInstaller {
+    #[serde(rename = "npm")]
+    Npm,
+    #[serde(rename = "gh-release")]
+    GhRelease,
+    #[serde(rename = "internal")]
+    Internal,
+    #[serde(rename = "other")]
+    Other,
+}
+
+impl CliUpdateInstaller {
+    /// Kept next to the wire values above so they cannot drift apart.
+    pub fn from_installer_str(installer: &str) -> Self {
+        match installer {
+            "npm" => Self::Npm,
+            "gh-release" => Self::GhRelease,
+            "internal" => Self::Internal,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// What kicked off the install/update. Travels across the process boundary
+/// as `--trigger=<value>`; [`CliUpdateTrigger::as_str`] and `FromStr` are
+/// the one rendering (round-trip pinned with the wire values in tests).
+///
+/// Volume caveat: one-shot `grok update` resolves telemetry from disk+env
+/// only, so `user_command` under-reports relative to the in-process
+/// `leader_converge` — the triggers are not directly comparable.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CliUpdateTrigger {
+    /// A human ran `grok update` or accepted an update prompt.
+    UserCommand,
+    /// TUI/stdio launch check spawned a detached update child.
+    AutoBackground,
+    /// The leader daemon's hourly in-process converge.
+    LeaderConverge,
+}
+
+impl CliUpdateTrigger {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::UserCommand => "user_command",
+            Self::AutoBackground => "auto_background",
+            Self::LeaderConverge => "leader_converge",
+        }
+    }
+}
+
+impl std::str::FromStr for CliUpdateTrigger {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "user_command" => Ok(Self::UserCommand),
+            "auto_background" => Ok(Self::AutoBackground),
+            "leader_converge" => Ok(Self::LeaderConverge),
+            other => Err(format!("unknown update trigger: {other}")),
+        }
+    }
 }
 
 #[derive(Serialize, Clone, Copy)]
@@ -349,7 +440,7 @@ pub struct PlanModeToggled {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// One contextual-hint impression or acceptance: per tip, how often it is
-/// shown vs. acted on (the `action` property drives the Mixpanel funnel).
+/// shown vs. acted on (the `action` property drives the product-analytics funnel).
 #[derive(Serialize)]
 pub struct ContextualTip {
     pub tip: ContextualTipKind,
@@ -394,39 +485,6 @@ pub struct YoloToggled {
 pub struct SlashCommandUsed {
     pub command: String,
     pub args_provided: bool,
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Permissions
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[derive(Serialize)]
-pub struct PermissionPrompted {
-    pub tool_name: String,
-    pub access_kind: AccessKind,
-    pub permission_mode: PermissionMode,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub subagent_session_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub subagent_type: Option<String>,
-}
-
-#[derive(Serialize)]
-pub struct PermissionDecisionPayload {
-    pub tool_name: String,
-    pub access_kind: AccessKind,
-    pub decision: PermissionOutcome,
-    pub wait_ms: u64,
-    pub permission_mode: PermissionMode,
-    /// Decision provenance (`config`/`user_reject`/`user_abort`/…), from
-    /// shell's `permission_decision_source`. Additive analytics-visible field, added
-    /// for the external `tool_decision` event (design ‡ footnote).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub subagent_session_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub subagent_type: Option<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -540,11 +598,45 @@ pub struct CompactionRetryDegraded {
 // Subagents
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Which spawn path owns a subagent's lifecycle.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentOwnerKind {
+    Task,
+    Workflow,
+    SchedulerLoop,
+}
+
+/// Which admission limit a spawn ran into.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentLimitKind {
+    SessionConcurrent,
+    WorkflowRunConcurrent,
+}
+
+/// What happened to the spawn that hit a limit.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentLimitDisposition {
+    Queued,
+    Failed,
+}
+
 #[derive(Serialize)]
 pub struct SubagentLaunched {
     pub subagent_id: String,
     pub parent_session_id: String,
     pub subagent_type: String,
+    pub owner: SubagentOwnerKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_run_id: Option<String>,
+    /// Time parked in the admission queue; absent if admitted immediately.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queued_ms: Option<u64>,
+    /// The session's running non-workflow subagents at launch, including
+    /// this one; max per session is the session's peak concurrency.
+    pub session_running: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub persona: Option<String>,
     pub fork_context: bool,
@@ -560,11 +652,139 @@ pub struct SubagentLaunched {
 pub struct SubagentCompleted {
     pub subagent_id: String,
     pub parent_session_id: String,
+    pub owner: SubagentOwnerKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_run_id: Option<String>,
     pub outcome: Outcome,
     pub duration_ms: u64,
     pub tool_calls: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens_used: Option<u64>,
+}
+
+#[derive(Serialize)]
+pub struct SubagentLimitHit {
+    pub parent_session_id: String,
+    pub limit_kind: SubagentLimitKind,
+    pub disposition: SubagentLimitDisposition,
+    pub limit: u64,
+    pub running: u32,
+    /// A queued spawn counts itself; absent for the workflow pool.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queued: Option<u32>,
+    pub owner: SubagentOwnerKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_run_id: Option<String>,
+}
+
+impl SubagentLimitHit {
+    /// The session pool's producer.
+    pub fn session_concurrent(
+        parent_session_id: String,
+        disposition: SubagentLimitDisposition,
+        limit: u64,
+        running: u32,
+        queue_depth: u32,
+        owner: SubagentOwnerKind,
+    ) -> Self {
+        Self {
+            parent_session_id,
+            limit_kind: SubagentLimitKind::SessionConcurrent,
+            disposition,
+            limit,
+            running,
+            queued: Some(queue_depth),
+            owner,
+            workflow_run_id: None,
+        }
+    }
+
+    /// The workflow pool's producer: waiters block on the run's semaphore,
+    /// so there is no queue depth to report.
+    pub fn workflow_run_concurrent(
+        parent_session_id: String,
+        workflow_run_id: String,
+        limit: u64,
+        slots_in_use: u32,
+    ) -> Self {
+        Self {
+            parent_session_id,
+            limit_kind: SubagentLimitKind::WorkflowRunConcurrent,
+            disposition: SubagentLimitDisposition::Queued,
+            limit,
+            running: slots_in_use,
+            queued: None,
+            owner: SubagentOwnerKind::Workflow,
+            workflow_run_id: Some(workflow_run_id),
+        }
+    }
+}
+
+/// Where a workflow script came from.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowSourceKind {
+    Builtin,
+    File,
+    Inline,
+}
+
+/// One workflow execution episode began (fresh launch or resume).
+#[derive(Serialize)]
+pub struct WorkflowRunStarted {
+    pub run_id: String,
+    pub parent_session_id: String,
+    pub source: WorkflowSourceKind,
+    /// Built-in workflow names only; user script names stay local.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_budget: Option<u64>,
+    /// Effective cap, after the CPU clamp.
+    pub max_concurrent_agents: u32,
+    pub resumed: bool,
+}
+
+/// The run tracker's status labels, plus `superseded` for an episode whose
+/// run a quick resume took over.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowRunEndStatus {
+    Active,
+    UserPaused,
+    BackOffPaused,
+    NoProgressPaused,
+    InfraPaused,
+    Blocked,
+    BudgetLimited,
+    Interrupted,
+    Complete,
+    Failed,
+    Cancelled,
+    Superseded,
+}
+
+#[derive(Serialize)]
+pub struct WorkflowRunEnded {
+    pub run_id: String,
+    pub parent_session_id: String,
+    pub status: WorkflowRunEndStatus,
+    /// Cumulative across the run's episodes.
+    pub duration_ms: u64,
+    /// Cumulative across the run's episodes.
+    pub agents_used: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_budget: Option<u64>,
+    /// This episode only.
+    pub agents_failed: u32,
+    /// This episode only.
+    pub peak_concurrent_agents: u32,
+    /// This episode only.
+    pub slot_waits: u32,
+    /// This episode only.
+    pub slot_wait_ms_total: u64,
+    /// This episode only.
+    pub slot_wait_ms_max: u64,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -891,7 +1111,7 @@ pub struct PromptSubmitted {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub screen_mode: Option<String>,
     /// Raw prompt text for the external stream's `OTEL_LOG_USER_PROMPTS`
-    /// gate **only**. `#[serde(skip)]`: never serialized to product events/Mixpanel;
+    /// gate **only**. `#[serde(skip)]`: never serialized to product events/analytics;
     /// dropped at external emit time unless the gate is on (then capped at
     /// 60 KB and secret-scrubbed).
     #[serde(skip)]
@@ -1115,7 +1335,7 @@ pub struct ToolCallCompleted {
     pub outcome: xai_file_utils::events::types::ToolOutcome,
     pub duration_ms: u64,
     /// Primary file path of the call, for the external stream only
-    /// (`#[serde(skip)]`: never serialized to product events/Mixpanel). Always reduced to
+    /// (`#[serde(skip)]`: never serialized to product events/analytics). Always reduced to
     /// `file_extension`; the full path rides the `OTEL_LOG_TOOL_DETAILS` gate.
     #[serde(skip)]
     pub file_path: Option<String>,
@@ -1185,6 +1405,32 @@ pub struct SessionEnded {
 // ---------------------------------------------------------------------------
 // Pager events (called from xai-grok-pager via log_event)
 // ---------------------------------------------------------------------------
+
+/// Connect outcome: the `agent_connect` product event, plus OTEL metrics.
+#[derive(Serialize)]
+pub struct AgentConnect {
+    pub connect_target: crate::startup::AgentKind,
+    pub outcome: crate::startup::StartupOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stuck_in: Option<String>,
+    pub phases: String,
+    pub phase_durations_ms: std::collections::BTreeMap<String, u64>,
+    pub elapsed_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+    pub embedded_fallback: bool,
+    pub auth_mode: crate::startup::AuthMode,
+}
+
+/// End to end startup: process start to a usable session, with the phase
+/// breakdown that accounts for it.
+#[derive(Serialize)]
+pub struct StartupComplete {
+    pub total_ms: u64,
+    pub outcome: crate::startup::StartupOutcome,
+    pub phases: String,
+    pub auth_mode: crate::startup::AuthMode,
+}
 
 #[derive(Serialize)]
 pub struct PagerSlashCommand {
@@ -1705,11 +1951,56 @@ pub struct ManualAuth {
     pub principal: Option<String>,
 }
 
+/// Release channel bucketed to the known set: channel is free-text user
+/// config, and recording it verbatim would leak private mirror names.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CliUpdateChannel {
+    Stable,
+    Alpha,
+    Enterprise,
+    Other,
+}
+
+impl CliUpdateChannel {
+    /// Empty means stable — the installers' default (mirrors the updater's
+    /// `is_stable_channel`).
+    pub fn from_channel_str(raw: &str) -> Self {
+        match raw.trim() {
+            "" | "stable" => Self::Stable,
+            "alpha" => Self::Alpha,
+            "enterprise" => Self::Enterprise,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// One attempt to download + activate a new `grok` binary. Analytics name:
+/// `grok-shell-cli_update`. Emitted on failure too; failures carry the
+/// typed `error_kind` only — freeform strings leak home paths.
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct CliUpdate {
+    pub outcome: CliUpdateOutcome,
+    pub trigger: CliUpdateTrigger,
+    pub from_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_version: Option<String>,
+    pub channel: CliUpdateChannel,
+    pub installer: CliUpdateInstaller,
+    /// `{os}-{arch}` from platform detection — closed by construction.
+    pub platform: String,
+    pub rosetta: bool,
+    pub duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<CliUpdateErrorKind>,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Event name bindings
 // ─────────────────────────────────────────────────────────────────────────────
 
 telemetry_event!(ManualAuth, "manual_auth");
+telemetry_event!(CliUpdate, "cli_update");
 
 telemetry_event!(Login, "login", external = crate::external::schema::map_auth);
 telemetry_event!(LoginPickerShown, "login_picker_shown");
@@ -1760,6 +2051,9 @@ telemetry_event!(
     "subagent_completed",
     external = crate::external::schema::map_subagent_completed
 );
+telemetry_event!(SubagentLimitHit, "subagent_limit_hit");
+telemetry_event!(WorkflowRunStarted, "workflow_run_started");
+telemetry_event!(WorkflowRunEnded, "workflow_run_ended");
 telemetry_event!(
     ModelSwitched,
     "model_switched",
@@ -1862,6 +2156,16 @@ telemetry_event!(
     SessionEnded,
     "session_ended",
     external = crate::external::schema::map_session_end
+);
+telemetry_event!(
+    AgentConnect,
+    "agent_connect",
+    external = crate::external::schema::map_agent_connect
+);
+telemetry_event!(
+    StartupComplete,
+    "startup_complete",
+    external = crate::external::schema::map_startup_complete
 );
 telemetry_event!(PagerSlashCommand, "pager_slash_command");
 telemetry_event!(PlanSubmit, "plan_submit");
@@ -2308,6 +2612,111 @@ mod tests {
             err,
             serde_json::json!({ "ok": false, "error": "failed to write key" })
         );
+    }
+
+    #[test]
+    fn cli_update_event_name_and_serde() {
+        assert_eq!(CliUpdate::NAME, "cli_update");
+        let ok = serde_json::to_value(CliUpdate {
+            outcome: CliUpdateOutcome::Success,
+            trigger: CliUpdateTrigger::UserCommand,
+            from_version: "0.2.118".into(),
+            to_version: Some("0.2.120".into()),
+            channel: CliUpdateChannel::Alpha,
+            installer: CliUpdateInstaller::Internal,
+            platform: "macos-x86_64".into(),
+            rosetta: true,
+            duration_ms: 12_000,
+            error_kind: None,
+        })
+        .unwrap();
+        assert_eq!(
+            ok,
+            serde_json::json!({
+                "outcome": "success",
+                "trigger": "user_command",
+                "from_version": "0.2.118",
+                "to_version": "0.2.120",
+                "channel": "alpha",
+                "installer": "internal",
+                "platform": "macos-x86_64",
+                "rosetta": true,
+                "duration_ms": 12000,
+            })
+        );
+        let fail = serde_json::to_value(CliUpdate {
+            outcome: CliUpdateOutcome::Failed,
+            trigger: CliUpdateTrigger::AutoBackground,
+            from_version: "0.2.118".into(),
+            to_version: Some("0.2.120".into()),
+            channel: CliUpdateChannel::Alpha,
+            installer: CliUpdateInstaller::Internal,
+            platform: "macos-x86_64".into(),
+            rosetta: true,
+            duration_ms: 60_100,
+            error_kind: Some(CliUpdateErrorKind::SmokeTimeout),
+        })
+        .unwrap();
+        assert_eq!(fail["outcome"], "failed");
+        assert_eq!(fail["error_kind"], "smoke_timeout");
+        assert_eq!(fail["trigger"], "auto_background");
+        assert!(fail.get("error").is_none());
+        assert_eq!(
+            serde_json::to_value(CliUpdateTrigger::LeaderConverge).unwrap(),
+            "leader_converge"
+        );
+        // Trigger as_str / FromStr / serde are one rendering.
+        for t in [
+            CliUpdateTrigger::UserCommand,
+            CliUpdateTrigger::AutoBackground,
+            CliUpdateTrigger::LeaderConverge,
+        ] {
+            assert_eq!(serde_json::to_value(t).unwrap(), t.as_str());
+            assert_eq!(t.as_str().parse::<CliUpdateTrigger>().unwrap(), t);
+        }
+        assert!("bogus".parse::<CliUpdateTrigger>().is_err());
+        // Wire values and from_installer_str round-trip — one mapping.
+        for (installer, wire) in [
+            (CliUpdateInstaller::Npm, "npm"),
+            (CliUpdateInstaller::GhRelease, "gh-release"),
+            (CliUpdateInstaller::Internal, "internal"),
+            (CliUpdateInstaller::Other, "other"),
+        ] {
+            assert_eq!(serde_json::to_value(installer).unwrap(), wire);
+            assert_eq!(CliUpdateInstaller::from_installer_str(wire), installer);
+        }
+        assert_eq!(
+            CliUpdateInstaller::from_installer_str("homebrew"),
+            CliUpdateInstaller::Other
+        );
+    }
+
+    /// Private mirror names bucket to Other; empty means stable.
+    #[test]
+    fn cli_update_channel_buckets() {
+        assert_eq!(
+            CliUpdateChannel::from_channel_str(" alpha "),
+            CliUpdateChannel::Alpha
+        );
+        assert_eq!(
+            CliUpdateChannel::from_channel_str(""),
+            CliUpdateChannel::Stable
+        );
+        assert_eq!(
+            CliUpdateChannel::from_channel_str("stable"),
+            CliUpdateChannel::Stable
+        );
+        assert_eq!(
+            CliUpdateChannel::from_channel_str("enterprise"),
+            CliUpdateChannel::Enterprise
+        );
+        for private in ["acme-mirror.1", "x'; rm -rf ~;'", "a b"] {
+            assert_eq!(
+                CliUpdateChannel::from_channel_str(private),
+                CliUpdateChannel::Other,
+                "{private:?} must bucket to other"
+            );
+        }
     }
 
     #[test]

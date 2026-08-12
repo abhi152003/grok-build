@@ -234,6 +234,7 @@ impl SessionActor {
             client_identifier,
             screen_mode,
             verbatim,
+            send_now,
             json_schema,
             origin,
             running_display,
@@ -254,6 +255,7 @@ impl SessionActor {
                 front.client_identifier.clone(),
                 front.screen_mode.clone(),
                 front.verbatim,
+                front.send_now,
                 front.json_schema.clone(),
                 front.origin.clone(),
                 running_display,
@@ -280,6 +282,7 @@ impl SessionActor {
             *current_prompt_id = Some(prompt_id.clone());
         }
         state.rewindable = true;
+        state.front_message_committed = false;
         self.agent
             .borrow()
             .tool_bridge()
@@ -318,6 +321,7 @@ impl SessionActor {
             client_identifier,
             screen_mode,
             verbatim,
+            send_now,
             json_schema,
             completion_tx,
             persist_ack,

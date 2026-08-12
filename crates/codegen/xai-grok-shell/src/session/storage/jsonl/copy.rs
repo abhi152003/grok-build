@@ -288,8 +288,8 @@ impl JsonlStorageAdapter {
         target_info: &Info,
         options: CopySessionOptions,
     ) -> io::Result<CopySessionResult> {
-        let target_dir = self.session_dir(target_info);
-        std::fs::create_dir_all(&target_dir)?;
+        // Canonical creator: the fork target chain is born owner-only.
+        let target_dir = self.create_session_dir_owner_only(target_info)?;
 
         let source_summary = self.read_summary_sync(source_info)?;
         let chat_format_version = source_summary.chat_format_version;
@@ -525,6 +525,19 @@ fn fork_summary(
         agent_name: source.agent_name,
         sandbox_profile: source.sandbox_profile,
         reasoning_effort: source.reasoning_effort,
+        // Full forks keep the parent's last turn. Partial forks
+        // (`target_prompt_index`) may drop that turn, so clear the summary
+        // rather than showing work that is not in the child conversation.
+        last_turn_summary: if options.target_prompt_index.is_some() {
+            None
+        } else {
+            source.last_turn_summary
+        },
+        last_turn_summary_prompt_id: if options.target_prompt_index.is_some() {
+            None
+        } else {
+            source.last_turn_summary_prompt_id
+        },
     }
 }
 
