@@ -10,15 +10,12 @@ pub mod activity;
 pub mod capability;
 pub mod channel;
 pub mod config;
-pub mod daemonize;
-pub mod diag_server;
 pub mod discovery;
 pub mod envrc;
 pub mod error;
 pub mod export_github;
 pub mod file_system;
 pub mod folder_trust;
-pub mod foreign_sessions;
 pub mod fs_notify;
 pub(crate) mod git_odb;
 pub mod handle;
@@ -27,19 +24,22 @@ pub mod hub_auth;
 pub mod hub_channel;
 pub mod hub_ids;
 pub mod hub_server;
+pub mod image_capabilities;
 pub mod mcp;
+pub(crate) mod path_virtualization;
 pub mod permission;
-pub mod preview_supervisor;
 pub mod project_config;
+pub mod publish;
 pub mod recovery;
 mod restore_fetch;
+pub mod scheduler_liveness;
 pub use restore_fetch::{EnsureCommitsOutcome, ensure_commits_reachable};
 pub use session::git::git_object_exists;
 pub mod rpc_envelope;
 pub mod session;
 pub mod status_config;
 pub(crate) mod telemetry;
-pub use status_config::StatusConfig;
+pub use status_config::{ProactiveRefreshConfig, StatusConfig};
 pub mod trust;
 pub(crate) mod upload;
 pub mod util;
@@ -58,6 +58,10 @@ pub use handle::{
     termination_grace_from_env,
 };
 pub use hub::HubConfig;
+pub use path_virtualization::{
+    ARTIFACTS_ALIAS, BindLifecycleCtx, BindMountError, BindMountHook, PathVirtualization,
+    VISIBLE_ROOT,
+};
 pub use permission::*;
 pub use session::{WorkspaceSession, WorkspaceShared};
 pub use session::{file_state, git, jj};
@@ -75,6 +79,7 @@ pub fn init_metrics() {
     upload::init_metrics();
     permission::init_metrics();
     hub_server::init_metrics();
+    hub_auth::init_metrics();
 }
 /// Crate-wide lock serializing every test that mutates the process-global
 /// environment (`GROK_HOME`, `HOME`, …). nextest isolates each test in its own
@@ -214,6 +219,21 @@ mod init_metrics_tests {
             "grok_workspace_toolset_swap_rejected_total",
             &[("reason", "turn_active"), ("trigger", "update_tool_config")]
         ));
+        for outcome in [
+            "ok",
+            "failed_retry",
+            "failed_exhausted",
+            "failed_terminal",
+            "skipped_disabled",
+        ] {
+            assert!(
+                has(
+                    "grok_workspace_oidc_proactive_refresh_total",
+                    &[("outcome", outcome)]
+                ),
+                "missing oidc refresh baseline outcome={outcome}"
+            );
+        }
         assert!(has(
             "grok_workspace_orphan_lost_total",
             &[("reason", "sha_mismatch")]

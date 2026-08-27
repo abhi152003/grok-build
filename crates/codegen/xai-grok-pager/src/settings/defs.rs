@@ -12,6 +12,7 @@ use crate::appearance::TextSelection;
 use crate::appearance::permission_cursor::DefaultSelectedPermission;
 
 use xai_grok_shell::agent::config::UiConfig;
+use xai_grok_shell::util::config::DISPLAY_REFRESH_DEFAULT_AUTO_CADENCE_ENABLED;
 use xai_grok_tools::implementations::grok_build::ask_user_question;
 
 // ---------------------------------------------------------------------------
@@ -217,6 +218,21 @@ const PLAN_MODE_CHOICES: &[EnumChoice] = &[
     },
 ];
 
+// Mid-turn follow-up routing. SHARED-owned, persisted to
+// `[ui].follow_up_behavior`. Canonicals match `FollowUpBehavior::as_canonical`.
+const FOLLOW_UP_BEHAVIOR_CHOICES: &[EnumChoice] = &[
+    EnumChoice {
+        canonical: "queue",
+        display: "Queue",
+        description: "Hold follow-ups until the current turn finishes.",
+    },
+    EnumChoice {
+        canonical: "steer",
+        display: "Steer",
+        description: "Inject follow-ups mid-turn at the next tool or model step.",
+    },
+];
+
 // ---------------------------------------------------------------------------
 // Mermaid-rendering catalog.
 //
@@ -277,7 +293,7 @@ const TEXT_SELECTION_CHOICES: &[EnumChoice] = &[
     EnumChoice {
         canonical: TextSelection::WordSelect.as_canonical(),
         display: "Word select (terminal-like)",
-        description: "Double-click selects & copies a word, triple-click a line; selection stays until dismissed.",
+        description: "Double-click selects & copies a word, triple-click a paragraph; selection stays until dismissed.",
     },
 ];
 
@@ -288,7 +304,7 @@ const HUNK_TRACKER_MODE_CHOICES: &[EnumChoice] = &[
     EnumChoice {
         canonical: "agent_only",
         display: "Agent only",
-        description: "Track only files the agent edits (default).",
+        description: "Track only files the agent edits.",
     },
     EnumChoice {
         canonical: "all_dirty",
@@ -298,7 +314,7 @@ const HUNK_TRACKER_MODE_CHOICES: &[EnumChoice] = &[
     EnumChoice {
         canonical: "off",
         display: "Off",
-        description: "Disable hunk tracking entirely. Also disables LOC tracking.",
+        description: "Disable hunk tracking entirely (default). Also disables LOC tracking.",
     },
 ];
 
@@ -633,6 +649,32 @@ pub fn default_settings() -> Vec<SettingMeta> {
             hidden_in_minimal: false,
         },
         SettingMeta {
+            key: "follow_up_behavior",
+            category: SettingCategory::Editor,
+            owner: SettingOwner::Shared,
+            label: "Follow-up behavior",
+            description: "What to do with messages you send while a turn is \
+                          running. Queue waits for the turn to finish; Steer \
+                          injects them mid-turn at the next tool batch or \
+                          model step. Default: Queue.",
+            keywords: &[
+                "queue",
+                "steer",
+                "interject",
+                "follow-up",
+                "followup",
+                "send",
+                "immediate",
+            ],
+            kind: SettingKind::Enum {
+                default: ui_default.follow_up_behavior(),
+                choices: FOLLOW_UP_BEHAVIOR_CHOICES,
+                supports_preview: false,
+            },
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
+        SettingMeta {
             key: "confirm_before_rewind",
             category: SettingCategory::Editor,
             owner: SettingOwner::Shared,
@@ -842,7 +884,9 @@ pub fn default_settings() -> Vec<SettingMeta> {
                 "whitelist",
             ],
             kind: SettingKind::Bool {
-                default: ui_default.remember_tool_approvals.unwrap_or(false),
+                // Resolver-shared const, so the modal shows the effective
+                // default when the user layer is unset.
+                default: xai_grok_shell::util::config::DEFAULT_REMEMBER_TOOL_APPROVALS,
             },
             restart_required: true,
             hidden_in_minimal: false,
@@ -1031,10 +1075,11 @@ pub fn default_settings() -> Vec<SettingMeta> {
                 "high", "120", "144",
             ],
             kind: SettingKind::Bool {
+                // Nested Option: None inherits DISPLAY_REFRESH_DEFAULT_AUTO_CADENCE_ENABLED.
                 default: ui_default
                     .display_refresh
                     .auto_cadence_enabled
-                    .unwrap_or(false),
+                    .unwrap_or(DISPLAY_REFRESH_DEFAULT_AUTO_CADENCE_ENABLED),
             },
             restart_required: true,
             hidden_in_minimal: true,
@@ -1125,7 +1170,9 @@ pub fn default_settings() -> Vec<SettingMeta> {
             restart_required: false,
             hidden_in_minimal: false,
         },
-        // SHELL-owned `flash` | `hold` on `[ui].keep_text_selection`.
+        // SHELL-owned `flash` | `hold` | `word_select` on `[ui].keep_text_selection`. Compile-time
+        // default `flash`; the default can be set remotely via the `keep_text_selection_default`
+        // soft-default (a staged rollout applied at startup, not in this static default).
         SettingMeta {
             key: "keep_text_selection",
             category: SettingCategory::Mouse,
@@ -1362,7 +1409,7 @@ pub fn default_settings() -> Vec<SettingMeta> {
                 "hunk", "tracker", "tracking", "diff", "changes", "git", "loc", "off", "disable",
             ],
             kind: SettingKind::Enum {
-                default: "agent_only",
+                default: "off",
                 choices: HUNK_TRACKER_MODE_CHOICES,
                 supports_preview: false,
             },

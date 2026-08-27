@@ -7,6 +7,11 @@ use crate::app::app_view::{ActiveView, AppView, WelcomeAnnouncementState};
 use crate::scrollback::state::ScrollbackState;
 use agent_client_protocol as acp;
 
+/// Refusal shown when a dispatch path can't proceed without a bound session. Every path in this
+/// module tree that says exactly this uses it; the action-specific variants ("No active session
+/// to delete") stay separate.
+pub(super) const NO_SESSION_NOTICE: &str = "No active session";
+
 /// The active agent's root session id, if any. Used to scope server-queue
 /// edit Effects to the foregrounded session.
 pub(super) fn active_agent_session_id(app: &AppView) -> Option<acp::SessionId> {
@@ -86,6 +91,19 @@ pub(super) fn get_active_agent_mut(app: &mut AppView) -> Option<&mut AgentView> 
         return Some(agent);
     }
     None
+}
+
+/// Child view when a fullscreen subagent overlay is open.
+///
+/// Unlike [`get_active_agent_mut`], never falls back to the parent.
+/// Overlay cancel uses this so the overlay-open check and cancel target cannot disagree.
+pub(super) fn active_subagent_view_mut(app: &mut AppView) -> Option<&mut AgentView> {
+    let ActiveView::Agent(id) = app.active_view else {
+        return None;
+    };
+    let agent = app.agents.get_mut(&id)?;
+    let child_sid = agent.active_subagent.clone()?;
+    agent.subagent_views.get_mut(&child_sid).map(|b| &mut **b)
 }
 
 /// Apply a closure to the active agent's scrollback (if any).
@@ -211,6 +229,37 @@ pub(super) fn surface_screen_mode_switch_hint(app: &mut AppView, target: AgentId
     }
 }
 
+/// Re-anchor the global permission-mode mirror to the active agent.
+pub(super) fn sync_active_permission_mode_mirror(app: &mut AppView) {
+    let ActiveView::Agent(target) = app.active_view else {
+        return;
+    };
+    let Some(agent) = app.agents.get(&target) else {
+        return;
+    };
+    let (is_yolo, is_auto) = (agent.session.is_yolo(), agent.session.is_auto());
+    let reanchor = if is_yolo {
+        Some("always-approve")
+    } else if is_auto && app.auto_mode_gate {
+        // Gate-aware: never re-anchor the global mirror to "auto" when the
+        // feature gate is off, even if a stale per-session `auto_mode`
+        // survived (defense-in-depth with the settings kill-switch fan-out).
+        Some("auto")
+    } else if matches!(
+        app.current_ui.permission_mode.as_deref(),
+        Some("always-approve") | Some("auto")
+    ) {
+        // Non-yolo/non-auto agent: clear a stale yolo/auto mirror left by a
+        // different agent; preserve an existing ask/default distinction.
+        Some("ask")
+    } else {
+        None
+    };
+    if let Some(canonical) = reanchor {
+        app.current_ui.permission_mode = Some(canonical.to_string());
+    }
+}
+
 /// Switch the active agent — the primary funnel for assigning `ActiveView::Agent`
 /// (new, resume, picker, fork); also fires [`surface_yolo_launch_block_notice`].
 ///
@@ -254,29 +303,7 @@ pub(crate) fn switch_to_agent(app: &mut AppView, target: AgentId, cause: SwitchC
     // cycle's `sync_active_auto_flag` (which derives from the global) can't copy a
     // different agent's stale Auto/Always-Approve onto this one. Per-session
     // yolo/auto are the source of truth; the global is a write-only mirror.
-    if let Some(agent) = app.agents.get(&target) {
-        let (is_yolo, is_auto) = (agent.session.is_yolo(), agent.session.is_auto());
-        let reanchor = if is_yolo {
-            Some("always-approve")
-        } else if is_auto && app.auto_mode_gate {
-            // Gate-aware: never re-anchor the global mirror to "auto" when the
-            // feature gate is off, even if a stale per-session `auto_mode`
-            // survived (defense-in-depth with the settings kill-switch fan-out).
-            Some("auto")
-        } else if matches!(
-            app.current_ui.permission_mode.as_deref(),
-            Some("always-approve") | Some("auto")
-        ) {
-            // Non-yolo/non-auto agent: clear a stale yolo/auto mirror left by a
-            // different agent; preserve an existing ask/default distinction.
-            Some("ask")
-        } else {
-            None
-        };
-        if let Some(c) = reanchor {
-            app.current_ui.permission_mode = Some(c.to_string());
-        }
-    }
+    sync_active_permission_mode_mirror(app);
     // Seed the auto feature gate on the (possibly new) active agent's slash
     // registry.
     app.sync_permission_mode_slash_gate();

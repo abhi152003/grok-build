@@ -165,7 +165,7 @@ fn plugin_cta_catalog_reload_empty_candidates_resets_matched_phase() {
     let id = AgentId(0);
     {
         let cta = &mut app.agents.get_mut(&id).unwrap().plugin_cta;
-        cta.official_source_present = true;
+        cta.source_url_or_path = Some(xai_grok_plugin_marketplace::OFFICIAL_SOURCE_GIT_URL.into());
         cta.candidates = vec![cta_entry("figma", "not_installed")];
         cta.phase = CtaPhase::Matched {
             plugin_relative_path: "plugins/figma".into(),
@@ -1555,6 +1555,17 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
             let away = !crate::appearance::cache::load_combine_queued_prompts();
             let _ = dispatch(Action::SetCombineQueuedPrompts(away), app);
         }
+        "follow_up_behavior" => {
+            let away = match crate::appearance::cache::load_follow_up_behavior() {
+                crate::appearance::FollowUpBehavior::Queue => {
+                    crate::appearance::FollowUpBehavior::Steer
+                }
+                crate::appearance::FollowUpBehavior::Steer => {
+                    crate::appearance::FollowUpBehavior::Queue
+                }
+            };
+            let _ = dispatch(Action::SetFollowUpBehavior(away), app);
+        }
         "simple_mode" => {
             let _ = dispatch(Action::SetSimpleMode(false), app);
         }
@@ -1634,7 +1645,7 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
             let _ = dispatch(Action::SetVimMode(true), app);
         }
         "remember_tool_approvals" => {
-            let _ = dispatch(Action::SetRememberToolApprovals(true), app);
+            let _ = dispatch(Action::SetRememberToolApprovals(false), app);
         }
         "toolset.ask_user_question.timeout_enabled" => {
             let _ = dispatch(Action::SetAskUserQuestionTimeoutEnabled(false), app);

@@ -48,6 +48,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 api_backend: Default::default(),
                 auth_scheme: Default::default(),
                 extra_headers: Default::default(),
+                extra_response_includes: Vec::new(),
                 query_params: Default::default(),
                 env_http_headers: Default::default(),
                 context_window: 100_000,
@@ -111,6 +112,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 tokio_util::sync::CancellationToken::new(),
             );
             let actor = Arc::new(SessionActor {
+                status_wake: Default::default(),
                 session_info,
                 auth_method_id: test_auth_method_id("test-auth"),
                 model_auth_memo: std::cell::RefCell::new(None),
@@ -120,7 +122,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 state: TokioMutex::new(State {
                     running_task: None,
                     pending_inputs: VecDeque::new(),
-                    combine_edit_holds: std::collections::HashSet::new(),
+                    edit_holds: HashMap::new(),
                     pending_notifications: Vec::new(),
                     notifications_suppressed: false,
                     rewindable: false,
@@ -139,7 +141,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 mcp_state: Arc::new(TokioMutex::new(McpState::new(vec![]))),
                 mcp_strategy: std::cell::Cell::new(McpInitStrategy::Blocking),
                 delivery_tools: std::cell::RefCell::new(Vec::new()),
-                attach_non_interactive: std::cell::Cell::new(false),
+                attach_non_interactive: std::rc::Rc::new(std::cell::Cell::new(false)),
                 chat_state_handle,
                 unattributed_background_usage: std::sync::atomic::AtomicBool::new(false),
                 current_prompt_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -200,6 +202,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 session_start: std::time::Instant::now(),
                 inference_idle_timeout: Duration::from_secs(300),
                 max_retries: 3,
+                rate_limit_waits: crate::session::acp_session::RateLimitWaitConfig::default(),
                 max_turns: None,
                 pending_interjections: InterjectionBuffer::new(),
                 pending_skill_reminders: Mutex::new(Vec::new()),
@@ -216,6 +219,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 agent: std::cell::RefCell::new(test_agent_default().await),
                 last_reported_branch: std::sync::Arc::new(parking_lot::Mutex::new(None)),
                 git_head_enabled: false,
+                status_line_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 models_manager: Default::default(),
                 display_cwd: std::sync::OnceLock::new(),
                 active_agent_type: parking_lot::Mutex::new(None),
@@ -263,13 +267,14 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 managed_mcp_handle: Default::default(),
                 initial_client_mcp_servers: vec![],
                 tool_metadata_snapshot: Arc::new(std::sync::Mutex::new(Default::default())),
-                mcp_announced_servers: Mutex::new(HashMap::new()),
+                mcp_announcements: Default::default(),
                 mcp_reminder_mode: McpReminderMode::Delta,
                 mcp_reminder_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 mcp_connecting_reminder_injected: std::cell::Cell::new(false),
                 mcp_handshakes_done: Arc::new(tokio::sync::Notify::new()),
                 user_input_generation: std::sync::atomic::AtomicU64::new(0),
                 laziness_debug_log: None,
+                last_live_orphan_reconcile: std::cell::Cell::new(None),
                 deferred_prefix: TaskSlot::new(),
                 extension_registry: xai_agent_lifecycle::LocalExtensionRegistry::default(),
                 last_announced_local_date: std::cell::Cell::new(chrono::Local::now().date_naive()),
@@ -277,6 +282,9 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 last_search_prompt_index: std::sync::atomic::AtomicI64::new(-1),
                 last_api_request_at: std::sync::atomic::AtomicI64::new(0),
                 hook_registry: std::cell::RefCell::new(None),
+                turn_report: Default::default(),
+                turn_abort: Default::default(),
+                turn_end_tx: Default::default(),
                 client_hooks: Default::default(),
                 hook_resolved_workspace_root: String::new(),
                 vcs_kind: xai_grok_workspace::session::git::VcsKind::Git,
@@ -291,11 +299,17 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 recap_epoch: std::cell::Cell::new(0),
                 turn_summary_task: std::cell::RefCell::new(None),
                 turn_summary_generation: std::cell::Cell::new(0),
+                title_refresh_task: std::cell::RefCell::new(None),
+                title_refresh_generation: std::cell::Cell::new(0),
+                next_title_refresh_idx: std::cell::Cell::new(0),
                 turn_summary_enabled: false,
+                title_refresh_enabled: false,
                 session_turn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 streaming_turn_capture: parking_lot::Mutex::new(StreamingTurnCapture::default()),
                 turn_stream_drained: parking_lot::Mutex::new(None),
+                pending_image_strip: parking_lot::Mutex::new(None),
                 sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
+                sampling_gate: None,
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
                 image_description_model: crate::test_support::TEST_MODEL.to_owned(),
                 image_describe_cache: Arc::new(
@@ -363,6 +377,7 @@ async fn first_turn_memory_injection_persists_to_chat_history() {
                     model: "test-model".to_string(),
                     max_completion_tokens: None,
                     extra_headers: Default::default(),
+                    extra_response_includes: Vec::new(),
                     query_params: Default::default(),
                     env_http_headers: Default::default(),
                     temperature: None,
@@ -497,6 +512,7 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 model: "test-model".to_string(),
                 max_completion_tokens: None,
                 extra_headers: Default::default(),
+                extra_response_includes: Vec::new(),
                 query_params: Default::default(),
                 env_http_headers: Default::default(),
                 temperature: None,
@@ -580,11 +596,13 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 search_config: crate::config::MemorySearchConfig::default(),
                 watcher: None,
                 stale_claim_secs: 60,
-                search_source: "tool",
+                search_source: crate::session::memory::MemorySearchSource::Tool,
+                observation_sink: crate::session::memory::noop_memory_observation_sink(),
                 embedding_credentials: crate::session::memory::EndpointScopedCredentials::none(),
             };
             let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
             let actor = Arc::new(SessionActor {
+                status_wake: Default::default(),
                 session_info: session_info.clone(),
                 auth_method_id: test_auth_method_id("test-auth"),
                 model_auth_memo: std::cell::RefCell::new(None),
@@ -594,7 +612,7 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 state: TokioMutex::new(State {
                     running_task: None,
                     pending_inputs: VecDeque::new(),
-                    combine_edit_holds: std::collections::HashSet::new(),
+                    edit_holds: HashMap::new(),
                     pending_notifications: Vec::new(),
                     notifications_suppressed: false,
                     rewindable: false,
@@ -613,7 +631,7 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 mcp_state: Arc::new(TokioMutex::new(McpState::new(vec![]))),
                 mcp_strategy: std::cell::Cell::new(McpInitStrategy::Blocking),
                 delivery_tools: std::cell::RefCell::new(Vec::new()),
-                attach_non_interactive: std::cell::Cell::new(false),
+                attach_non_interactive: std::rc::Rc::new(std::cell::Cell::new(false)),
                 chat_state_handle,
                 unattributed_background_usage: std::sync::atomic::AtomicBool::new(false),
                 current_prompt_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -677,6 +695,7 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 session_start: std::time::Instant::now(),
                 inference_idle_timeout: Duration::from_secs(300),
                 max_retries: 3,
+                rate_limit_waits: crate::session::acp_session::RateLimitWaitConfig::default(),
                 max_turns: None,
                 pending_interjections: InterjectionBuffer::new(),
                 pending_skill_reminders: Mutex::new(Vec::new()),
@@ -693,6 +712,7 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 agent: std::cell::RefCell::new(test_agent_default().await),
                 last_reported_branch: std::sync::Arc::new(parking_lot::Mutex::new(None)),
                 git_head_enabled: false,
+                status_line_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 models_manager: Default::default(),
                 display_cwd: std::sync::OnceLock::new(),
                 active_agent_type: parking_lot::Mutex::new(None),
@@ -740,13 +760,14 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 managed_mcp_handle: Default::default(),
                 initial_client_mcp_servers: vec![],
                 tool_metadata_snapshot: Arc::new(std::sync::Mutex::new(Default::default())),
-                mcp_announced_servers: Mutex::new(HashMap::new()),
+                mcp_announcements: Default::default(),
                 mcp_reminder_mode: McpReminderMode::Delta,
                 mcp_reminder_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 mcp_connecting_reminder_injected: std::cell::Cell::new(false),
                 mcp_handshakes_done: Arc::new(tokio::sync::Notify::new()),
                 user_input_generation: std::sync::atomic::AtomicU64::new(0),
                 laziness_debug_log: None,
+                last_live_orphan_reconcile: std::cell::Cell::new(None),
                 deferred_prefix: TaskSlot::new(),
                 extension_registry: xai_agent_lifecycle::LocalExtensionRegistry::default(),
                 last_announced_local_date: std::cell::Cell::new(chrono::Local::now().date_naive()),
@@ -754,6 +775,9 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 last_search_prompt_index: std::sync::atomic::AtomicI64::new(-1),
                 last_api_request_at: std::sync::atomic::AtomicI64::new(0),
                 hook_registry: std::cell::RefCell::new(None),
+                turn_report: Default::default(),
+                turn_abort: Default::default(),
+                turn_end_tx: Default::default(),
                 client_hooks: Default::default(),
                 hook_resolved_workspace_root: String::new(),
                 vcs_kind: xai_grok_workspace::session::git::VcsKind::Git,
@@ -768,11 +792,17 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 recap_epoch: std::cell::Cell::new(0),
                 turn_summary_task: std::cell::RefCell::new(None),
                 turn_summary_generation: std::cell::Cell::new(0),
+                title_refresh_task: std::cell::RefCell::new(None),
+                title_refresh_generation: std::cell::Cell::new(0),
+                next_title_refresh_idx: std::cell::Cell::new(0),
                 turn_summary_enabled: false,
+                title_refresh_enabled: false,
                 session_turn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 streaming_turn_capture: parking_lot::Mutex::new(StreamingTurnCapture::default()),
                 turn_stream_drained: parking_lot::Mutex::new(None),
+                pending_image_strip: parking_lot::Mutex::new(None),
                 sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
+                sampling_gate: None,
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
                 image_description_model: crate::test_support::TEST_MODEL.to_owned(),
                 image_describe_cache: Arc::new(
@@ -853,7 +883,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
             let state = TokioMutex::new(State {
                 running_task: None,
                 pending_inputs: VecDeque::new(),
-                combine_edit_holds: std::collections::HashSet::new(),
+                edit_holds: HashMap::new(),
                 pending_notifications: Vec::new(),
                 notifications_suppressed: false,
                 rewindable: false,
@@ -873,6 +903,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 )
                 .await;
             let actor = SessionActor {
+                status_wake: Default::default(),
                 session_info: SessionInfo {
                     id: acp::SessionId::new("test-cancel"),
                     cwd: cwd.as_str().to_string(),
@@ -897,7 +928,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 mcp_state: Arc::new(TokioMutex::new(McpState::new(vec![]))),
                 mcp_strategy: std::cell::Cell::new(McpInitStrategy::Blocking),
                 delivery_tools: std::cell::RefCell::new(Vec::new()),
-                attach_non_interactive: std::cell::Cell::new(false),
+                attach_non_interactive: std::rc::Rc::new(std::cell::Cell::new(false)),
                 chat_state_handle: xai_chat_state::ChatStateHandle::noop(),
                 unattributed_background_usage: std::sync::atomic::AtomicBool::new(false),
                 current_prompt_id: std::sync::Arc::new(
@@ -968,6 +999,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 session_start: std::time::Instant::now(),
                 inference_idle_timeout: Duration::from_secs(300),
                 max_retries: 3,
+                rate_limit_waits: crate::session::acp_session::RateLimitWaitConfig::default(),
                 max_turns: None,
                 pending_interjections: InterjectionBuffer::new(),
                 pending_skill_reminders: Mutex::new(Vec::new()),
@@ -984,6 +1016,9 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 agent: std::cell::RefCell::new(agent),
                 last_reported_branch: std::sync::Arc::new(parking_lot::Mutex::new(None)),
                 git_head_enabled: false,
+                status_line_enabled: std::sync::Arc::new(
+                    std::sync::atomic::AtomicBool::new(false),
+                ),
                 models_manager: Default::default(),
                 display_cwd: std::sync::OnceLock::new(),
                 active_agent_type: parking_lot::Mutex::new(None),
@@ -1040,13 +1075,14 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 tool_metadata_snapshot: Arc::new(
                     std::sync::Mutex::new(Default::default()),
                 ),
-                mcp_announced_servers: Mutex::new(HashMap::new()),
+                mcp_announcements: Default::default(),
                 mcp_reminder_mode: McpReminderMode::Delta,
                 mcp_reminder_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 mcp_connecting_reminder_injected: std::cell::Cell::new(false),
                 mcp_handshakes_done: Arc::new(tokio::sync::Notify::new()),
                 user_input_generation: std::sync::atomic::AtomicU64::new(0),
                 laziness_debug_log: None,
+                last_live_orphan_reconcile: std::cell::Cell::new(None),
                 deferred_prefix: TaskSlot::new(),
                 extension_registry: xai_agent_lifecycle::LocalExtensionRegistry::default(),
                 last_announced_local_date: std::cell::Cell::new(
@@ -1056,6 +1092,9 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 last_search_prompt_index: std::sync::atomic::AtomicI64::new(-1),
                 last_api_request_at: std::sync::atomic::AtomicI64::new(0),
                 hook_registry: std::cell::RefCell::new(None),
+                turn_report: Default::default(),
+                turn_abort: Default::default(),
+                turn_end_tx: Default::default(),
                 client_hooks: Default::default(),
                 hook_resolved_workspace_root: String::new(),
                 vcs_kind: xai_grok_workspace::session::git::VcsKind::Git,
@@ -1072,7 +1111,11 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 recap_epoch: std::cell::Cell::new(0),
                 turn_summary_task: std::cell::RefCell::new(None),
                 turn_summary_generation: std::cell::Cell::new(0),
+                title_refresh_task: std::cell::RefCell::new(None),
+                title_refresh_generation: std::cell::Cell::new(0),
+                next_title_refresh_idx: std::cell::Cell::new(0),
                 turn_summary_enabled: false,
+                title_refresh_enabled: false,
                 session_turn_active: std::sync::Arc::new(
                     std::sync::atomic::AtomicBool::new(false),
                 ),
@@ -1080,7 +1123,9 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                     StreamingTurnCapture::default(),
                 ),
                 turn_stream_drained: parking_lot::Mutex::new(None),
+                pending_image_strip: parking_lot::Mutex::new(None),
                 sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
+                sampling_gate: None,
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
                 image_description_model: crate::test_support::TEST_MODEL.to_owned(),
                 image_describe_cache: Arc::new(
@@ -1113,13 +1158,16 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                         screen_mode: None,
                         verbatim: false,
                         json_schema: None,
-                        origin: crate::session::PromptOrigin::User,
+                        input_origin: InputOrigin::new(
+                            crate::session::PromptOrigin::User,
+                        ),
                         task_wake_fallback: None,
                         tool_overrides_update: None,
                         respond_to: tx,
                         persist_ack: None,
                         parsed_prompt_tx: None,
                         queue_meta: None,
+                        queue_mutation_policy: QueueMutationPolicy::hidden(),
                         send_now: false,
                     });
             }
@@ -1216,13 +1264,9 @@ async fn cancel_records_mid_turn_abort_interrupt_marker() {
         })
         .await;
 }
-/// A mid-stream abort with NO tool in flight leaves the model with no visible
-/// signal: the partial assistant text is discarded out-of-band and there is no
-/// dangling tool call to repair into a "cancelled" tool-result. So
-/// `cancel_running_task` must arm the one-shot `pending_interrupt_reminder` that
-/// the next real user prompt turns into a `<system-reminder>`.
+/// No assistant text → do not arm the interrupt reminder.
 #[tokio::test(flavor = "current_thread")]
-async fn cancel_without_active_tool_arms_interrupt_reminder() {
+async fn cancel_without_assistant_text_skips_interrupt_reminder() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -1256,15 +1300,15 @@ async fn cancel_without_active_tool_arms_interrupt_reminder() {
                 })
                 .await;
             assert!(
-                actor.events.take_pending_interrupt_reminder(),
-                "a no-active-tool abort must arm the interrupt reminder"
+                !actor.events.take_pending_interrupt_reminder(),
+                "an abort with no assistant text must NOT arm the interrupt reminder"
             );
         })
         .await;
 }
 /// Send-now is a silent cancel-and-send — the user is continuing, not
-/// aborting. Its cancel must arm NEITHER the interrupt reminder (no
-/// "[Request interrupted]" injected into the continuation turn) NOR the
+/// aborting. Its cancel must arm NEITHER the interrupt envelope (no
+/// interrupt lead-in on the continuation turn) NOR the
 /// zombie wait guard from the aborted turn can't auto-send-now-cancel (and
 /// drop) the next user prompt.
 #[tokio::test(flavor = "current_thread")]
@@ -1372,69 +1416,117 @@ async fn cancel_with_dangling_tool_call_skips_interrupt_reminder() {
         })
         .await;
 }
-/// Once armed, `maybe_inject_interrupt_reminder` injects the interrupt notice as
-/// a `<system-reminder>` user item exactly once (one-shot).
+/// Once armed, `maybe_apply_interrupt_envelope` frames the next user query
+/// with the interjection envelope exactly once (one-shot).
 #[tokio::test(flavor = "current_thread")]
-async fn maybe_inject_interrupt_reminder_injects_once() {
+async fn maybe_apply_interrupt_envelope_is_one_shot() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
             let (actor, _gateway_rx) = build_actor().await;
             actor.events.set_pending_interrupt_reminder();
-            actor.maybe_inject_interrupt_reminder().await;
-            let conversation = actor.chat_state_handle.get_conversation().await;
-            let reminder = match conversation.last() {
-                Some(ConversationItem::User(u)) => u,
-                other => {
-                    panic!("expected a trailing user system-reminder, got: {other:?}")
-                }
-            };
-            assert_eq!(
-                reminder.synthetic_reason,
-                Some(SyntheticReason::SystemReminder),
-                "interrupt notice must be a system-reminder"
-            );
-            let text = conversation
-                .last()
-                .expect("non-empty conversation")
-                .text_content();
-            assert!(
-                text.contains(crate::session::acp_session::INTERRUPT_REMINDER),
-                "reminder must carry the interrupt notice, got: {text}"
-            );
+            let assembled = "<user_query>\nfollow-up after interrupt\n</user_query>";
+            let framed = actor.maybe_apply_interrupt_envelope(assembled.into(), false);
+            assert_eq!(framed, frame_user_turn(INTERRUPT_NOTE, assembled));
             assert!(!actor.events.take_pending_interrupt_reminder());
-            let len_before = conversation.len();
-            actor.maybe_inject_interrupt_reminder().await;
-            let after = actor.chat_state_handle.get_conversation().await;
-            assert_eq!(
-                after.len(),
-                len_before,
-                "interrupt reminder must be one-shot"
+            let again = actor.maybe_apply_interrupt_envelope(assembled.into(), false);
+            assert_eq!(again, assembled, "interrupt envelope must be one-shot");
+        })
+        .await;
+}
+/// Headless `--verbatim` / ACP `_meta.verbatim` owns the exact prompt. Framing
+/// would break that contract; the one-shot still fires so it cannot leak onto
+/// a later non-verbatim user turn.
+#[tokio::test(flavor = "current_thread")]
+async fn maybe_apply_interrupt_envelope_skips_verbatim() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (actor, _gateway_rx) = build_actor().await;
+            actor.events.set_pending_interrupt_reminder();
+            let assembled = "caller-owned follow-up";
+            let framed = actor.maybe_apply_interrupt_envelope(assembled.into(), true);
+            assert_eq!(framed, assembled, "verbatim text must stay byte-identical");
+            assert!(
+                !actor.events.take_pending_interrupt_reminder(),
+                "verbatim still consumes the one-shot"
             );
         })
         .await;
 }
-/// Integration (production wiring + ordering): with the one-shot armed, a real
-/// user turn driven through `handle_prompt` injects the interrupt
-/// `<system-reminder>` immediately before the user's message. The unit test
-/// above exercises only the helper in isolation; this guards the
-/// `PromptOrigin::User` call site in `handle_prompt` and the relative ordering.
-/// Synchronizes on the persist-ack (fires after both items are pushed, before
-/// the model call), then aborts the turn so the dead-URL model call can't hang.
+/// Integration: with the one-shot armed, a real user turn driven through
+/// `handle_prompt` frames the query in the same envelope as an interjection
+/// (lead-in + `<user_query>` + unfinished-task trailer) instead of a
+/// preceding `<system-reminder>`. Synchronizes on the persist-ack (fires
+/// after the user item is pushed, before the model call), then aborts the
+/// turn so the dead-URL model call can't hang.
 #[tokio::test(flavor = "current_thread")]
-async fn handle_prompt_injects_interrupt_reminder_before_user_message() {
+async fn handle_prompt_frames_interrupt_on_user_message() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
             let actor = actor_with_persistence_drain().await;
             actor.events.set_pending_interrupt_reminder();
-            let prompt_blocks = vec![acp::ContentBlock::Text(acp::TextContent::new("follow-up after interrupt".to_string()))];
+            let query = "follow-up after interrupt";
+            let prompt_blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(
+                query.to_string(),
+            ))];
             let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
             let actor_for_prompt = actor.clone();
             let prompt_task = tokio::task::spawn_local(async move {
                 actor_for_prompt
                     .handle_prompt(
                         "interrupt-wiring-test",
+                        prompt_blocks,
+                        PromptMode::Agent,
+                        None,
+                        None,
+                        None,
+                        None,
+                        false,
+                        false,
+                        None,
+                        Some(ack_tx),
+                        None,
+                    )
+                    .await
+            });
+            assert!(ack_rx.await.is_ok(), "persist ack should resolve");
+            let conv = actor.chat_state_handle.get_conversation().await;
+            let user = conv
+                .iter()
+                .find(|item| {
+                    matches!(item, ConversationItem::User(u) if u.synthetic_reason.is_none())
+                        && item.text_content().contains(query)
+                })
+                .expect("the user message must be in the conversation");
+            let text = user.text_content();
+            let expected_assembled = format!("<user_query>\n{query}\n</user_query>");
+            assert_eq!(text, frame_user_turn(INTERRUPT_NOTE, &expected_assembled));
+            assert!(!actor.events.take_pending_interrupt_reminder());
+            prompt_task.abort();
+        })
+        .await;
+}
+/// Integration: a verbatim user turn must stay byte-identical to the caller
+/// text even when the interrupt one-shot is armed.
+#[tokio::test(flavor = "current_thread")]
+async fn handle_prompt_verbatim_skips_interrupt_envelope() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let actor = actor_with_persistence_drain().await;
+            actor.events.set_pending_interrupt_reminder();
+            let query = "caller-owned follow-up";
+            let prompt_blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(
+                query.to_string(),
+            ))];
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let actor_for_prompt = actor.clone();
+            let prompt_task = tokio::task::spawn_local(async move {
+                actor_for_prompt
+                    .handle_prompt(
+                        "interrupt-verbatim-test",
                         prompt_blocks,
                         PromptMode::Agent,
                         None,
@@ -1451,29 +1543,69 @@ async fn handle_prompt_injects_interrupt_reminder_before_user_message() {
             });
             assert!(ack_rx.await.is_ok(), "persist ack should resolve");
             let conv = actor.chat_state_handle.get_conversation().await;
-            let user_idx = conv
+            let user = conv
                 .iter()
-                .position(|item| {
-                    matches!(item, ConversationItem::User(u) if u.synthetic_reason.is_none()) && item.text_content().contains("follow-up after interrupt")
+                .find(|item| {
+                    matches!(item, ConversationItem::User(u) if u.synthetic_reason.is_none())
+                        && item.text_content().contains(query)
                 })
                 .expect("the user message must be in the conversation");
-            assert!(
-                user_idx > 0,
-                "a reminder must precede the user message (found it at index 0)"
-            );
-            let preceding = &conv[user_idx - 1];
-            assert!(
-                matches!(preceding, ConversationItem::User(u)
-                    if u.synthetic_reason == Some(SyntheticReason::SystemReminder)),
-                "the item immediately before the user message must be a system-reminder, got: {preceding:?}"
-            );
-            assert!(
-                preceding
-                    .text_content()
-                    .contains(crate::session::acp_session::INTERRUPT_REMINDER),
-                "the preceding system-reminder must carry the interrupt notice"
-            );
+            assert_eq!(user.text_content(), query);
+            assert!(!user.text_content().contains(INTERRUPT_NOTE));
             assert!(!actor.events.take_pending_interrupt_reminder());
+            prompt_task.abort();
+        })
+        .await;
+}
+/// Send-now must use the full interjection envelope (prefix + already-wrapped
+/// `<user_query>` + unfinished-task trailer), not the note prefix alone.
+#[tokio::test(flavor = "current_thread")]
+async fn handle_prompt_send_now_frames_interjection_envelope() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let actor = actor_with_persistence_drain().await;
+            let query = "create /tmp/A";
+            let prompt_blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(
+                query.to_string(),
+            ))];
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let actor_for_prompt = actor.clone();
+            let prompt_task = tokio::task::spawn_local(async move {
+                actor_for_prompt
+                    .handle_prompt(
+                        "send-now-envelope-test",
+                        prompt_blocks,
+                        PromptMode::Agent,
+                        None,
+                        None,
+                        None,
+                        None,
+                        false,
+                        true,
+                        None,
+                        Some(ack_tx),
+                        None,
+                    )
+                    .await
+            });
+            assert!(ack_rx.await.is_ok(), "persist ack should resolve");
+            let conv = actor.chat_state_handle.get_conversation().await;
+            let user = conv
+                .iter()
+                .find(|item| {
+                    matches!(item, ConversationItem::User(u) if u.synthetic_reason.is_none())
+                        && item.text_content().contains(query)
+                })
+                .expect("the send-now user message must be in the conversation");
+            let expected_assembled = format!("<user_query>\n{query}\n</user_query>");
+            assert_eq!(
+                user.text_content(),
+                frame_user_turn(
+                    xai_interjection_core::INTERJECTION_NOTE,
+                    &expected_assembled
+                )
+            );
             prompt_task.abort();
         })
         .await;
@@ -1519,10 +1651,10 @@ async fn handle_prompt_synthetic_origin_preserves_interrupt_reminder() {
             );
             let conv = actor.chat_state_handle.get_conversation().await;
             assert!(
-                !conv.iter().any(|item| item
-                    .text_content()
-                    .contains(crate::session::acp_session::INTERRUPT_REMINDER)),
-                "a synthetic-origin turn must not inject the interrupt reminder"
+                !conv
+                    .iter()
+                    .any(|item| item.text_content().contains(INTERRUPT_NOTE)),
+                "a synthetic-origin turn must not inject the interrupt envelope"
             );
             prompt_task.abort();
         })
@@ -1546,7 +1678,7 @@ async fn cancel_running_task_interactive_preserves_queued_work() {
             screen_mode: None,
             verbatim: false,
             json_schema: None,
-            origin: crate::session::PromptOrigin::User,
+            input_origin: InputOrigin::new(crate::session::PromptOrigin::User),
             task_wake_fallback: None,
             tool_overrides_update: None,
             respond_to,
@@ -1561,6 +1693,7 @@ async fn cancel_running_task_interactive_preserves_queued_work() {
                 text: String::new(),
                 combined_texts: None,
             }),
+            queue_mutation_policy: QueueMutationPolicy::editable(),
             send_now: false,
         };
         (item, rx)
@@ -1929,7 +2062,8 @@ async fn assert_stop_trigger_arms_wake_barrier(trigger: &str) {
                     user_initiated: true,
                     ..Default::default()
                 })
-                .await;
+                .await
+                .barrier;
             assert_eq!(
                 barrier,
                 super::tasks_cancel::WakeBarrier::Armed,
@@ -2046,7 +2180,8 @@ async fn non_stop_cancels_preserve_queued_task_wakes_and_do_not_arm_barrier() {
                         user_initiated: true,
                         ..Default::default()
                     })
-                    .await;
+                    .await
+                    .barrier;
                 assert_eq!(
                     barrier,
                     super::tasks_cancel::WakeBarrier::Clear,
@@ -2102,7 +2237,7 @@ async fn cancel_resolves_front_when_running_task_is_none() {
             screen_mode: None,
             verbatim: false,
             json_schema: None,
-            origin: crate::session::PromptOrigin::User,
+            input_origin: InputOrigin::new(crate::session::PromptOrigin::User),
             task_wake_fallback: None,
             tool_overrides_update: None,
             respond_to,
@@ -2117,6 +2252,7 @@ async fn cancel_resolves_front_when_running_task_is_none() {
                 text: String::new(),
                 combined_texts: None,
             }),
+            queue_mutation_policy: QueueMutationPolicy::editable(),
             send_now: false,
         };
         (item, rx)
@@ -2230,6 +2366,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 api_backend: xai_grok_sampler::ApiBackend::Responses,
                 auth_scheme: Default::default(),
                 extra_headers: Default::default(),
+                extra_response_includes: Vec::new(),
                 query_params: Default::default(),
                 env_http_headers: Default::default(),
                 context_window: 100_000,
@@ -2289,7 +2426,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
             let state = TokioMutex::new(State {
                 running_task: None,
                 pending_inputs: VecDeque::new(),
-                combine_edit_holds: std::collections::HashSet::new(),
+                edit_holds: HashMap::new(),
                 pending_notifications: Vec::new(),
                 notifications_suppressed: false,
                 rewindable: false,
@@ -2309,6 +2446,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 )
                 .await;
             let actor = SessionActor {
+                status_wake: Default::default(),
                 session_info: SessionInfo {
                     id: acp::SessionId::new("test-cancel-sampler"),
                     cwd: cwd.as_str().to_string(),
@@ -2333,7 +2471,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 mcp_state: Arc::new(TokioMutex::new(McpState::new(vec![]))),
                 mcp_strategy: std::cell::Cell::new(McpInitStrategy::Blocking),
                 delivery_tools: std::cell::RefCell::new(Vec::new()),
-                attach_non_interactive: std::cell::Cell::new(false),
+                attach_non_interactive: std::rc::Rc::new(std::cell::Cell::new(false)),
                 chat_state_handle: xai_chat_state::ChatStateHandle::noop(),
                 unattributed_background_usage: std::sync::atomic::AtomicBool::new(false),
                 current_prompt_id: std::sync::Arc::new(
@@ -2404,6 +2542,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 session_start: std::time::Instant::now(),
                 inference_idle_timeout: Duration::from_secs(300),
                 max_retries: 3,
+                rate_limit_waits: crate::session::acp_session::RateLimitWaitConfig::default(),
                 max_turns: None,
                 pending_interjections: InterjectionBuffer::new(),
                 pending_skill_reminders: Mutex::new(Vec::new()),
@@ -2420,6 +2559,9 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 agent: std::cell::RefCell::new(agent),
                 last_reported_branch: std::sync::Arc::new(parking_lot::Mutex::new(None)),
                 git_head_enabled: false,
+                status_line_enabled: std::sync::Arc::new(
+                    std::sync::atomic::AtomicBool::new(false),
+                ),
                 models_manager: Default::default(),
                 display_cwd: std::sync::OnceLock::new(),
                 active_agent_type: parking_lot::Mutex::new(None),
@@ -2476,13 +2618,14 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 tool_metadata_snapshot: Arc::new(
                     std::sync::Mutex::new(Default::default()),
                 ),
-                mcp_announced_servers: Mutex::new(HashMap::new()),
+                mcp_announcements: Default::default(),
                 mcp_reminder_mode: McpReminderMode::Delta,
                 mcp_reminder_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 mcp_connecting_reminder_injected: std::cell::Cell::new(false),
                 mcp_handshakes_done: Arc::new(tokio::sync::Notify::new()),
                 user_input_generation: std::sync::atomic::AtomicU64::new(0),
                 laziness_debug_log: None,
+                last_live_orphan_reconcile: std::cell::Cell::new(None),
                 deferred_prefix: TaskSlot::new(),
                 extension_registry: xai_agent_lifecycle::LocalExtensionRegistry::default(),
                 last_announced_local_date: std::cell::Cell::new(
@@ -2492,6 +2635,9 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 last_search_prompt_index: std::sync::atomic::AtomicI64::new(-1),
                 last_api_request_at: std::sync::atomic::AtomicI64::new(0),
                 hook_registry: std::cell::RefCell::new(None),
+                turn_report: Default::default(),
+                turn_abort: Default::default(),
+                turn_end_tx: Default::default(),
                 client_hooks: Default::default(),
                 hook_resolved_workspace_root: String::new(),
                 vcs_kind: xai_grok_workspace::session::git::VcsKind::Git,
@@ -2508,7 +2654,11 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 recap_epoch: std::cell::Cell::new(0),
                 turn_summary_task: std::cell::RefCell::new(None),
                 turn_summary_generation: std::cell::Cell::new(0),
+                title_refresh_task: std::cell::RefCell::new(None),
+                title_refresh_generation: std::cell::Cell::new(0),
+                next_title_refresh_idx: std::cell::Cell::new(0),
                 turn_summary_enabled: false,
+                title_refresh_enabled: false,
                 session_turn_active: std::sync::Arc::new(
                     std::sync::atomic::AtomicBool::new(false),
                 ),
@@ -2516,7 +2666,9 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                     StreamingTurnCapture::default(),
                 ),
                 turn_stream_drained: parking_lot::Mutex::new(None),
+                pending_image_strip: parking_lot::Mutex::new(None),
                 sampler_handle: sampler_handle.clone(),
+                sampling_gate: None,
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
                 image_description_model: crate::test_support::TEST_MODEL.to_owned(),
                 image_describe_cache: Arc::new(
@@ -2672,7 +2824,7 @@ async fn cancel_keeps_remaining_queued_prompts_visible_to_clients() {
             screen_mode: None,
             verbatim: false,
             json_schema: None,
-            origin: crate::session::PromptOrigin::User,
+            input_origin: InputOrigin::new(crate::session::PromptOrigin::User),
             task_wake_fallback: None,
             tool_overrides_update: None,
             respond_to,
@@ -2687,6 +2839,7 @@ async fn cancel_keeps_remaining_queued_prompts_visible_to_clients() {
                 text: String::new(),
                 combined_texts: None,
             }),
+            queue_mutation_policy: QueueMutationPolicy::editable(),
             send_now: false,
         }
     }

@@ -4,6 +4,7 @@
 
 use agent_client_protocol as acp;
 use xai_grok_shell::agent::config::UiConfig;
+use xai_grok_shell::util::config::DISPLAY_REFRESH_DEFAULT_AUTO_CADENCE_ENABLED;
 use xai_grok_tools::implementations::grok_build::ask_user_question;
 
 // ---------------------------------------------------------------------------
@@ -355,15 +356,15 @@ pub fn canonical_voice_stt_language(value: Option<&str>) -> &'static str {
 }
 
 /// Canonicalize a raw hunk-tracker mode to a registry choice. Case-insensitive
-/// and trimmed; `disabled` aliases `off`; unknown/blank/`None` → `agent_only`.
+/// and trimmed; `disabled` aliases `off`; unknown/blank/`None` → `off`.
 pub fn canonical_hunk_tracker_mode(value: Option<&str>) -> &'static str {
     let raw = value.unwrap_or_default().trim();
     if raw.eq_ignore_ascii_case("all_dirty") {
         "all_dirty"
-    } else if raw.eq_ignore_ascii_case("off") || raw.eq_ignore_ascii_case("disabled") {
-        "off"
-    } else {
+    } else if raw.eq_ignore_ascii_case("agent_only") {
         "agent_only"
+    } else {
+        "off"
     }
 }
 
@@ -520,6 +521,9 @@ pub fn current_value_for(
         "combine_queued_prompts" => Some(SettingValue::Bool(
             crate::appearance::cache::load_combine_queued_prompts(),
         )),
+        "follow_up_behavior" => Some(SettingValue::Enum(
+            crate::appearance::cache::load_follow_up_behavior().as_canonical(),
+        )),
         "confirm_before_rewind" => Some(SettingValue::Bool(ui.confirm_before_rewind_enabled())),
         "simple_mode" => Some(SettingValue::Bool(ui.simple_mode.unwrap_or(true))),
         // Per-tip contextual hints — `None` (inherit) reads as the default ON.
@@ -561,9 +565,11 @@ pub fn current_value_for(
         "invert_scroll" => Some(SettingValue::Bool(
             crate::appearance::cache::load_invert_scroll(),
         )),
-        // Nested `[ui.display_refresh].auto_cadence_enabled`; None → default false.
+        // Nested `[ui.display_refresh].auto_cadence_enabled`; None → compiled default.
         "display_refresh_auto_cadence" => Some(SettingValue::Bool(
-            ui.display_refresh.auto_cadence_enabled.unwrap_or(false),
+            ui.display_refresh
+                .auto_cadence_enabled
+                .unwrap_or(DISPLAY_REFRESH_DEFAULT_AUTO_CADENCE_ENABLED),
         )),
         "scroll_lines" => Some(SettingValue::Int(
             crate::appearance::cache::load_scroll_lines()
@@ -652,9 +658,10 @@ pub fn current_value_for(
             "ask"
         })),
         // remember_tool_approvals: reflects the user-config layer the modal
-        // toggles (other layers feed the effective gate at spawn). None → false.
+        // toggles. None → the resolver-shared default.
         "remember_tool_approvals" => Some(SettingValue::Bool(
-            ui.remember_tool_approvals.unwrap_or(false),
+            ui.remember_tool_approvals
+                .unwrap_or(xai_grok_shell::util::config::DEFAULT_REMEMBER_TOOL_APPROVALS),
         )),
         // ask_user_question timeout: reflects the effective TOML merge; the
         // toggle writes the user layer, and env/remote settings tiers feed the
@@ -855,6 +862,13 @@ mod tests {
                         "combine_queued_prompts default drifts from UiConfig::default()"
                     );
                 }
+                ("follow_up_behavior", SettingKind::Enum { default, .. }) => {
+                    assert_eq!(
+                        *default,
+                        ui.follow_up_behavior(),
+                        "follow_up_behavior default drifts from UiConfig::default()"
+                    );
+                }
                 ("simple_mode", SettingKind::Bool { default }) => {
                     assert_eq!(
                         *default,
@@ -971,12 +985,14 @@ mod tests {
                         "vim_mode default drifts from UiConfig::default()"
                     );
                 }
-                // remember_tool_approvals: Option<bool>; None → false.
+                // remember_tool_approvals: anchored on the resolver-shared
+                // const so the modal cannot drift from the gate.
                 ("remember_tool_approvals", SettingKind::Bool { default }) => {
                     assert_eq!(
                         *default,
-                        ui.remember_tool_approvals.unwrap_or(false),
-                        "remember_tool_approvals default drifts from UiConfig::default()"
+                        xai_grok_shell::util::config::DEFAULT_REMEMBER_TOOL_APPROVALS,
+                        "remember_tool_approvals default drifts from the shared \
+                         resolver const in xai-grok-shell"
                     );
                 }
                 // ask_user_question timeout: no UiConfig mirror (lives under
@@ -1024,6 +1040,9 @@ mod tests {
                     );
                 }
                 ("keep_text_selection", SettingKind::Enum { default, .. }) => {
+                    // The compile-time default is flash; the `word_select`
+                    // default is a startup-applied remote rollout flag, not part
+                    // of this static registry default.
                     let expected = if ui.keep_text_selection_enabled() {
                         "hold"
                     } else {
@@ -1063,7 +1082,7 @@ mod tests {
                         "voice_stt_language default drifts from UiConfig::default()",
                     );
                 }
-                // hunk_tracker_mode: Option<String>; None → "agent_only".
+                // hunk_tracker_mode: Option<String>; None → "off".
                 ("hunk_tracker_mode", SettingKind::Enum { default, .. }) => {
                     assert_eq!(
                         ui.hunk_tracker_mode, None,
@@ -1132,12 +1151,15 @@ mod tests {
                         "invert_scroll default drifts from UiConfig::default()"
                     );
                 }
-                // display_refresh.auto_cadence_enabled: Option<bool>; None → false.
+                // display_refresh.auto_cadence_enabled: Option<bool>; None →
+                // DISPLAY_REFRESH_DEFAULT_AUTO_CADENCE_ENABLED.
                 ("display_refresh_auto_cadence", SettingKind::Bool { default }) => {
                     assert_eq!(
                         *default,
-                        ui.display_refresh.auto_cadence_enabled.unwrap_or(false),
-                        "display_refresh_auto_cadence default drifts from UiConfig::default()"
+                        ui.display_refresh
+                            .auto_cadence_enabled
+                            .unwrap_or(DISPLAY_REFRESH_DEFAULT_AUTO_CADENCE_ENABLED),
+                        "display_refresh_auto_cadence default drifts from resolve default"
                     );
                 }
                 // scroll_lines: Option<u8>; None → registry default 3 (the
@@ -1398,10 +1420,14 @@ mod tests {
         assert_eq!(canonical_hunk_tracker_mode(Some("  OFF  ")), "off");
         assert_eq!(canonical_hunk_tracker_mode(Some("Disabled")), "off");
         assert_eq!(canonical_hunk_tracker_mode(Some("All_Dirty")), "all_dirty");
-        // Unknown / blank / absent → the `agent_only` default.
-        assert_eq!(canonical_hunk_tracker_mode(Some("bogus")), "agent_only");
-        assert_eq!(canonical_hunk_tracker_mode(Some("")), "agent_only");
-        assert_eq!(canonical_hunk_tracker_mode(None), "agent_only");
+        assert_eq!(
+            canonical_hunk_tracker_mode(Some("  Agent_Only  ")),
+            "agent_only"
+        );
+        // Unknown / blank / absent → the `off` default.
+        assert_eq!(canonical_hunk_tracker_mode(Some("bogus")), "off");
+        assert_eq!(canonical_hunk_tracker_mode(Some("")), "off");
+        assert_eq!(canonical_hunk_tracker_mode(None), "off");
     }
 
     #[test]

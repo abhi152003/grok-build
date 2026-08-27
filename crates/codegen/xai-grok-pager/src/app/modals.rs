@@ -69,6 +69,8 @@ impl AgentView {
             billing_surface_visible: slash_controller.billing_surface_visible(),
             usage_command_visible: slash_controller.usage_command_visible(),
             workflows_available: slash_controller.workflows_available(),
+            saved_workflows: slash_controller.registry().saved_workflows(),
+            workflow_runs: slash_controller.workflow_runs(),
             screen_mode: slash_controller.screen_mode(),
             current_title: slash_controller.current_title(),
         };
@@ -454,6 +456,10 @@ impl AgentView {
                     return match usage_modal::handle_usage_modal_key(state, key) {
                         UsageModalOutcome::CopySessionId => {
                             self.copy_usage_modal_session_id();
+                            InputOutcome::Changed
+                        }
+                        UsageModalOutcome::CopyText(text) => {
+                            self.copy_usage_modal_text(&text);
                             InputOutcome::Changed
                         }
                         UsageModalOutcome::Changed => InputOutcome::Changed,
@@ -898,6 +904,8 @@ impl AgentView {
                                         content_results: None,
                                         content_loading: false,
                                         deep_search_seq: 0,
+                                        generation: 0,
+                                        detail_seq: 0,
                                         entries_query: None,
                                         source_filter:
                                             crate::views::session_picker::SourceFilter::default(),
@@ -1602,9 +1610,11 @@ impl AgentView {
             }
         }
 
-        // UsageInfo: chrome (close / tab clicks / footer copy), then wheel scroll.
+        // UsageInfo: chrome first (tabs / close / footer stay clickable), then drag / wheel.
         if let Some(ActiveModal::UsageInfo { state }) = &mut self.active_modal {
-            use crate::views::usage_modal::{self, COPY_SESSION_ID_SHORTCUT, UsageModalOutcome};
+            use crate::views::usage_modal::{
+                self, COPY_ALL_SESSION_INFO_SHORTCUT, COPY_SESSION_ID_SHORTCUT, UsageModalOutcome,
+            };
             let outcome =
                 mw::handle_modal_mouse(&mut state.window, mouse.kind, mouse.column, mouse.row);
             match outcome {
@@ -1617,12 +1627,47 @@ impl AgentView {
                     return InputOutcome::Changed;
                 }
                 ModalWindowOutcome::ShortcutActivated(id) => {
+                    // Footer click: drop gesture + hover.
+                    state.clear_text_drag();
                     if id == COPY_SESSION_ID_SHORTCUT {
                         self.copy_usage_modal_session_id();
+                    } else if id == COPY_ALL_SESSION_INFO_SHORTCUT {
+                        let text = match self.active_modal.as_ref() {
+                            Some(ActiveModal::UsageInfo { state }) => state.session_info_copy_all(),
+                            _ => None,
+                        };
+                        if let Some(text) = text {
+                            self.copy_usage_modal_text(&text);
+                        }
                     }
                     return InputOutcome::Changed;
                 }
-                ModalWindowOutcome::Handled => return InputOutcome::Changed,
+                ModalWindowOutcome::Handled => {
+                    match mouse.kind {
+                        // Same rule as content: bare Moved with an active drag is a
+                        // lost Up. Pending press is left alone for click-to-copy.
+                        MouseEventKind::Moved => {
+                            if state.has_active_drag() {
+                                return match state.finish_lost_drag() {
+                                    UsageModalOutcome::CopyText(text) => {
+                                        self.copy_usage_modal_text(&text);
+                                        InputOutcome::Changed
+                                    }
+                                    _ => {
+                                        state.hovered_copy_line = None;
+                                        InputOutcome::Changed
+                                    }
+                                };
+                            }
+                            state.hovered_copy_line = None;
+                        }
+                        // Same-tab click and other chrome Downs: drop gesture + hover.
+                        _ => {
+                            state.clear_text_drag();
+                        }
+                    }
+                    return InputOutcome::Changed;
+                }
                 ModalWindowOutcome::Unhandled => {
                     return match usage_modal::handle_usage_modal_mouse(
                         state,
@@ -1632,6 +1677,10 @@ impl AgentView {
                     ) {
                         UsageModalOutcome::CopySessionId => {
                             self.copy_usage_modal_session_id();
+                            InputOutcome::Changed
+                        }
+                        UsageModalOutcome::CopyText(text) => {
+                            self.copy_usage_modal_text(&text);
                             InputOutcome::Changed
                         }
                         UsageModalOutcome::Changed => InputOutcome::Changed,
@@ -1716,6 +1765,13 @@ impl AgentView {
             return;
         };
         let delivery = crate::clipboard::copy_text_or_file(&id);
+        self.show_toast(delivery.toast_message().as_ref());
+    }
+
+    /// Copy Session-info text (`y` / footer "copy all") and toast the
+    /// delivery outcome. Mirrors [`Self::copy_usage_modal_session_id`].
+    fn copy_usage_modal_text(&mut self, text: &str) {
+        let delivery = crate::clipboard::copy_text_or_file(text);
         self.show_toast(delivery.toast_message().as_ref());
     }
 
@@ -2097,7 +2153,7 @@ impl AgentView {
                     // Append content search result rows (same pattern as welcome).
                     let content_start = picker_entries.len() + 1;
                     let content_entry_data = if let Some(hits) = content_results.as_deref()
-                        && *source_filter != crate::views::session_picker::SourceFilter::External
+                        && !source_filter.is_content_search_disabled()
                         && !filter_query.is_empty()
                     {
                         build_content_entry_data(
@@ -2111,8 +2167,8 @@ impl AgentView {
                         Vec::new()
                     };
                     let has_content_rows = !content_entry_data.is_empty();
-                    let effective_content_loading = *content_loading
-                        && *source_filter != crate::views::session_picker::SourceFilter::External;
+                    let effective_content_loading =
+                        *content_loading && !source_filter.is_content_search_disabled();
                     let spinner_label = build_content_header_label(
                         effective_content_loading,
                         has_content_rows,
@@ -2486,6 +2542,8 @@ mod session_picker_delete_tests {
             repo_name: "repo".into(),
             worktree_label: None,
             last_turn_summary: None,
+            last_recap: None,
+            session_kind: None,
             card_detail: None,
         }
     }
@@ -2501,6 +2559,8 @@ mod session_picker_delete_tests {
             content_results: None,
             content_loading: false,
             deep_search_seq: 0,
+            generation: 0,
+            detail_seq: 0,
             entries_query: None,
             source_filter: crate::views::session_picker::SourceFilter::default(),
             pending_delete: None,

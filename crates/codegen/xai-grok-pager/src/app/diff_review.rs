@@ -5,8 +5,8 @@ use std::sync::OnceLock;
 
 use serde_json::Value;
 use tempfile::NamedTempFile;
-use wait_timeout::ChildExt;
 use tracing::warn;
+use wait_timeout::ChildExt;
 
 /// Whether editor diff review is enabled. Cached once per process.
 pub fn editor_review_enabled() -> bool {
@@ -424,14 +424,18 @@ mod tests {
 
     #[test]
     fn try_build_search_replace() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("x.rs");
+        std::fs::write(&file, "let x = 1;").unwrap();
         let raw = serde_json::json!({
             "variant": "SearchReplace",
-            "file_path": "/tmp/x.rs",
+            "file_path": file.to_str().unwrap(),
             "old_string": "let x = 1;",
             "new_string": "let x = 2;",
         });
-        let d = PendingEditorDiff::try_build(&raw, ReviewMode::Code, std::path::PathBuf::from("/tmp"))
-            .expect("SearchReplace builds");
+        let d =
+            PendingEditorDiff::try_build(&raw, ReviewMode::Code, std::path::PathBuf::from("/tmp"))
+                .expect("SearchReplace builds");
         let old = std::fs::read_to_string(d.old_tmp.path()).unwrap();
         let new = std::fs::read_to_string(d.new_tmp.path()).unwrap();
         assert_eq!(old, "let x = 1;");
@@ -441,12 +445,18 @@ mod tests {
     #[test]
     fn try_build_unsupported_variant_returns_none() {
         let raw = serde_json::json!({ "variant": "HashlineEdit", "file_path": "/tmp/x.rs" });
-        assert!(PendingEditorDiff::try_build(&raw, ReviewMode::Code, std::path::PathBuf::from("/tmp")).is_none());
+        assert!(
+            PendingEditorDiff::try_build(&raw, ReviewMode::Code, std::path::PathBuf::from("/tmp"))
+                .is_none()
+        );
     }
 
     #[test]
     fn try_build_missing_variant_returns_none() {
         let raw = serde_json::json!({ "file_path": "/tmp/x.rs" });
-        assert!(PendingEditorDiff::try_build(&raw, ReviewMode::Code, std::path::PathBuf::from("/tmp")).is_none());
+        assert!(
+            PendingEditorDiff::try_build(&raw, ReviewMode::Code, std::path::PathBuf::from("/tmp"))
+                .is_none()
+        );
     }
 }

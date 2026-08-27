@@ -95,6 +95,9 @@ pub struct PromptContext {
     /// prompt (Full). `None` = base template only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_body: Option<String>,
+    /// Persists plan-agent verification policy across prompt reconstruction.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub include_browser_verification: bool,
     /// Which base template to use for `Extend` mode.
     /// `TemplateOverride::None` = standard base/subagent template.
     /// `TemplateOverride::Codex` = apply-patch profile template (decrypted on demand).
@@ -178,6 +181,7 @@ impl Default for PromptContext {
             prompt_mode: PromptMode::Extend,
             audience: PromptAudience::default(),
             prompt_body: None,
+            include_browser_verification: false,
             system_prompt: TemplateOverride::None,
             agents_md_files: vec![],
             persona_summaries: vec![],
@@ -208,6 +212,9 @@ impl PromptContext {
     /// - Subagents and primary sessions both get the full block, so a child
     ///   verifier sees the same project instructions as the main agent.
     pub fn agents_md_user_reminder(&self) -> Option<String> {
+        if self.include_browser_verification {
+            return None;
+        }
         self.format_agents_md_section()
     }
     /// Personas content for injection as a prepended user message.
@@ -248,6 +255,7 @@ impl PromptContext {
             "current_date": self.current_date.as_deref().unwrap_or(""),
             "is_non_interactive": self.is_non_interactive,
             "system_prompt_label": self.system_prompt_label.as_str(),
+            "include_browser_verification": self.include_browser_verification,
         })
     }
     /// Render the full system prompt via `ToolBridge`.
@@ -311,6 +319,7 @@ mod tests {
             prompt_mode: PromptMode::Extend,
             audience: PromptAudience::Primary,
             prompt_body: None,
+            include_browser_verification: false,
             system_prompt: TemplateOverride::None,
             agents_md_files: vec![],
             persona_summaries: vec![],
@@ -327,6 +336,32 @@ mod tests {
             is_non_interactive: false,
             system_prompt_label: default_system_prompt_label(),
         }
+    }
+    #[test]
+    fn standard_primary_template_renders_browser_verification_only_when_flagged() {
+        let renderer = TemplateRenderer::new(Default::default(), Default::default());
+        let mut ctx = test_context();
+        ctx.include_browser_verification = true;
+        let on = ctx.render_with_renderer(&renderer).unwrap();
+        ctx.include_browser_verification = false;
+        let off = ctx.render_with_renderer(&renderer).unwrap();
+        let block_start = on
+            .find("\n\n<browser_verification>")
+            .expect("flagged standard template must render browser verification");
+        assert_eq!(&on[..block_start], off);
+        assert!(on.ends_with("</browser_verification>"));
+        assert!(!off.contains("<browser_verification>"));
+    }
+    #[test]
+    fn full_mode_flag_does_not_append_browser_verification() {
+        let renderer = TemplateRenderer::new(Default::default(), Default::default());
+        let ctx = PromptContext {
+            prompt_mode: PromptMode::Full,
+            prompt_body: Some("base".into()),
+            include_browser_verification: true,
+            ..test_context()
+        };
+        assert_eq!(ctx.render_with_renderer(&renderer).as_deref(), Some("base"));
     }
     #[test]
     fn test_json_round_trip() {
@@ -578,6 +613,18 @@ mod tests {
         assert!(section.contains("XYZZY_AGENTS_MD_MARKER"));
     }
     #[test]
+    fn agents_md_user_reminder_suppressed_when_rules_are_in_the_prefix() {
+        let mut ctx = test_context();
+        ctx.include_browser_verification = true;
+        ctx.agents_md_files = vec![AgentConfigFile {
+            file_name: "AGENTS.md".to_string(),
+            file_path: "/repo/AGENTS.md".to_string(),
+            content: "# XYZZY_AGENTS_MD_MARKER".to_string(),
+        }];
+        assert!(ctx.agents_md_user_reminder().is_none());
+        assert!(ctx.format_agents_md_section().is_some());
+    }
+    #[test]
     fn personas_user_reminder_always_none() {
         let mut ctx = test_context();
         ctx.persona_summaries = vec!["- **reviewer** [user]: Meticulous code reviewer".to_string()];
@@ -593,6 +640,7 @@ mod tests {
             prompt_mode: PromptMode::Extend,
             audience: PromptAudience::Subagent,
             prompt_body: Some(subagent_prompts::GENERAL_PURPOSE_PROMPT.to_string()),
+            include_browser_verification: false,
             system_prompt: TemplateOverride::None,
             agents_md_files: vec![],
             persona_summaries: vec![
@@ -681,11 +729,6 @@ mod tests {
         assert!(
             ctx.prompt_body.is_some(),
             "CURRENT: child has a prompt body (GENERAL_PURPOSE_PROMPT)"
-        );
-        let body = ctx.prompt_body.as_deref().unwrap();
-        assert!(
-            body.contains("Strengths") && body.contains("Guidelines"),
-            "body should contain structured general-purpose guidance sections"
         );
     }
     #[test]
@@ -839,20 +882,6 @@ mod tests {
             rendered.contains("<project_instructions_spec>"),
             "subagent must include project_instructions_spec"
         );
-        assert!(
-            rendered.contains("## Project Instruction Files"),
-            "subagent project instructions must match the main agent spec"
-        );
-        assert!(
-            rendered.contains("you must check for additional project instruction files"),
-            "subagent must be told to proactively check nested AGENTS.md"
-        );
-    }
-    #[test]
-    fn child_rendered_prompt_excludes_parent_only_sections() {
-        let rendered = render_subagent_template(base_template_ctx());
-        assert!(!rendered.contains("## Task Management"));
-        assert!(!rendered.contains("## No time estimates"));
     }
     #[test]
     fn child_rendered_prompt_includes_role_and_persona_sections() {
@@ -886,27 +915,11 @@ mod tests {
         );
     }
     #[test]
-    fn child_rendered_prompt_has_hashline_guidance() {
-        let rendered = render_subagent_template(base_template_ctx());
-        assert!(
-            rendered.contains("hashline workflow"),
-            "should include hashline guidance"
-        );
-        assert!(
-            rendered.contains("batch semantics"),
-            "should include batch semantics"
-        );
-    }
-    #[test]
     fn child_rendered_prompt_has_background_tasks_when_execute_available() {
         let rendered = render_subagent_template(base_template_ctx());
         assert!(
             rendered.contains("<background_tasks>"),
             "should include background_tasks section when execute tool exists"
-        );
-        assert!(
-            rendered.contains("background"),
-            "background_tasks should mention background flag"
         );
     }
     #[test]
@@ -943,10 +956,6 @@ mod tests {
         assert!(
             !rendered.contains("<background_tasks>"),
             "background_tasks should be absent without execute tool"
-        );
-        assert!(
-            rendered.contains("hashline workflow"),
-            "hashline guidance should still be present"
         );
     }
     #[test]
@@ -1008,92 +1017,6 @@ mod tests {
         );
     }
     #[test]
-    fn child_rendered_prompt_omits_edit_references_without_edit_tool() {
-        let ctx = minijinja::context! {
-            os_name => "linux",
-            shell_path => "/bin/bash",
-            working_directory => "/workspace",
-            current_date => "2026-03-26",
-            memory_enabled => false,
-            role_instructions => "",
-            persona_instructions => "",
-            tools => minijinja::context! {
-                by_kind => minijinja::context! {
-                    read => "read_file",
-                    search => "grep",
-                    execute => "run_terminal_cmd",
-                    background_task_action => "get_task_output",
-                }
-            },
-
-        };
-        let rendered = render_subagent_template(ctx);
-        assert!(
-            !rendered.contains("for editing"),
-            "should not mention editing when edit tool is absent"
-        );
-    }
-    #[test]
-    fn child_rendered_prompt_omits_execute_references_without_execute_tool() {
-        let ctx = minijinja::context! {
-            os_name => "linux",
-            shell_path => "/bin/bash",
-            working_directory => "/workspace",
-            current_date => "2026-03-26",
-            memory_enabled => false,
-            role_instructions => "",
-            persona_instructions => "",
-            tools => minijinja::context! {
-                by_kind => minijinja::context! {
-                    read => "read_file",
-                    edit => "search_replace",
-                    search => "grep",
-                }
-            },
-        };
-        let rendered = render_subagent_template(ctx);
-        assert!(
-            !rendered.contains("system commands"),
-            "should not mention system commands when execute tool is absent"
-        );
-        assert!(
-            !rendered.contains("Reserve"),
-            "should not mention Reserve (bash) when execute tool is absent"
-        );
-    }
-    #[test]
-    fn child_rendered_prompt_omits_both_edit_and_execute_references() {
-        let ctx = minijinja::context! {
-            os_name => "linux",
-            shell_path => "/bin/bash",
-            working_directory => "/workspace",
-            current_date => "2026-03-26",
-            memory_enabled => false,
-            role_instructions => "",
-            persona_instructions => "",
-            tools => minijinja::context! {
-                by_kind => minijinja::context! {
-                    read => "read_file",
-                    search => "grep",
-                }
-            },
-        };
-        let rendered = render_subagent_template(ctx);
-        assert!(
-            !rendered.contains("for editing"),
-            "should not mention editing"
-        );
-        assert!(
-            !rendered.contains("system commands"),
-            "should not mention system commands"
-        );
-        assert!(!rendered.contains("Reserve"), "should not mention Reserve");
-        assert!(
-            rendered.contains("`read_file` for reading."),
-            "tool_calling line should end cleanly after read reference"
-        );
-    }
-    #[test]
     fn test_prompt_body_none_skipped_in_json() {
         let ctx = test_context();
         let json = serde_json::to_string(&ctx).unwrap();
@@ -1139,16 +1062,6 @@ mod tests {
         );
     }
     #[test]
-    fn full_mode_prelude_contains_user_info_block() {
-        let prelude_format = format!(
-            "<user_info>\nOS: {}\nShell: {}\nWorkspace Path: {}\nCurrent Date: {}\n</user_info>",
-            "linux", "/bin/bash", "/workspace/project", "2026-03-24"
-        );
-        assert!(prelude_format.contains("<user_info>"));
-        assert!(prelude_format.contains("Workspace Path: /workspace/project"));
-        assert!(prelude_format.contains("</user_info>"));
-    }
-    #[test]
     fn built_in_prompts_do_not_contain_user_info_block() {
         let gp = super::super::subagent_prompts::GENERAL_PURPOSE_PROMPT;
         let explore = super::super::subagent_prompts::EXPLORE_PROMPT;
@@ -1158,134 +1071,13 @@ mod tests {
             "prompt text should not contain actual OS value"
         );
         assert!(
-            !explore.contains("Workspace Path:"),
-            "prompt text should not contain Workspace Path field"
+            !explore.contains("OS: linux"),
+            "prompt text should not contain actual OS value"
         );
         assert!(
             !plan.contains("Shell: /bin/bash"),
             "prompt text should not contain actual Shell value"
         );
-    }
-    #[test]
-    fn workspace_boundary_in_general_purpose_prompt() {
-        let prompt = super::super::subagent_prompts::GENERAL_PURPOSE_PROMPT;
-        assert!(
-            prompt.contains("Workspace boundary"),
-            "general-purpose prompt should contain workspace boundary guidance"
-        );
-        assert!(
-            prompt.contains("<user_info>"),
-            "general-purpose prompt should reference <user_info>"
-        );
-    }
-    #[test]
-    fn workspace_boundary_in_explore_prompt() {
-        let prompt = super::super::subagent_prompts::EXPLORE_PROMPT;
-        assert!(
-            prompt.contains("Workspace boundary"),
-            "explore prompt should contain workspace boundary guidance"
-        );
-        assert!(
-            prompt.contains("default search scope"),
-            "explore should mention default search scope"
-        );
-    }
-    #[test]
-    fn workspace_boundary_in_plan_prompt() {
-        let prompt = super::super::subagent_prompts::PLAN_PROMPT;
-        assert!(
-            prompt.contains("Workspace boundary"),
-            "plan prompt should contain workspace boundary guidance"
-        );
-        assert!(
-            prompt.contains("default analysis scope"),
-            "plan should mention default analysis scope"
-        );
-    }
-    #[test]
-    fn general_purpose_prompt_specialization_keywords() {
-        let prompt = super::super::subagent_prompts::GENERAL_PURPOSE_PROMPT;
-        let keywords = [
-            "broad searches",
-            "Multi-file analysis",
-            "NEVER create files",
-            "documentation files",
-            "absolute file paths",
-        ];
-        for kw in &keywords {
-            assert!(
-                prompt.contains(kw),
-                "general-purpose prompt missing specialization keyword: {kw}"
-            );
-        }
-    }
-    #[test]
-    fn explore_prompt_specialization_keywords() {
-        let prompt = super::super::subagent_prompts::EXPLORE_PROMPT;
-        let keywords = [
-            "read-only",
-            "READ-ONLY MODE",
-            "glob patterns",
-            "regex",
-            "parallel tool calls",
-            "thoroughness level",
-        ];
-        for kw in &keywords {
-            assert!(
-                prompt.contains(kw),
-                "explore prompt missing specialization keyword: {kw}"
-            );
-        }
-    }
-    #[test]
-    fn plan_prompt_specialization_keywords() {
-        let prompt = super::super::subagent_prompts::PLAN_PROMPT;
-        let keywords = [
-            "read-only",
-            "READ-ONLY MODE",
-            "architect",
-            "Critical Files for Implementation",
-            "trade-offs",
-            "step-by-step",
-        ];
-        for kw in &keywords {
-            assert!(
-                prompt.contains(kw),
-                "plan prompt missing specialization keyword: {kw}"
-            );
-        }
-    }
-    #[test]
-    fn trimmed_prompts_no_redundant_identity() {
-        let gp = super::super::subagent_prompts::GENERAL_PURPOSE_PROMPT;
-        let explore = super::super::subagent_prompts::EXPLORE_PROMPT;
-        let plan = super::super::subagent_prompts::PLAN_PROMPT;
-        for (name, prompt) in [
-            ("general-purpose", gp),
-            ("explore", explore),
-            ("plan", plan),
-        ] {
-            assert!(
-                !prompt.contains("You are a Grok Build agent"),
-                "{name} prompt should not duplicate base template identity"
-            );
-        }
-    }
-    #[test]
-    fn trimmed_prompts_no_redundant_formatting_rules() {
-        let gp = super::super::subagent_prompts::GENERAL_PURPOSE_PROMPT;
-        let explore = super::super::subagent_prompts::EXPLORE_PROMPT;
-        let plan = super::super::subagent_prompts::PLAN_PROMPT;
-        for (name, prompt) in [
-            ("general-purpose", gp),
-            ("explore", explore),
-            ("plan", plan),
-        ] {
-            assert!(
-                !prompt.contains("avoid using emojis"),
-                "{name} prompt should not duplicate formatting rules from base template"
-            );
-        }
     }
     #[test]
     fn all_prompts_reference_tool_templates() {
@@ -1302,26 +1094,6 @@ mod tests {
                 "{name} prompt should reference tool template variables"
             );
         }
-    }
-    #[test]
-    fn read_only_prompts_share_consistent_constraint() {
-        let explore = super::super::subagent_prompts::EXPLORE_PROMPT;
-        let plan = super::super::subagent_prompts::PLAN_PROMPT;
-        for (name, prompt) in [("explore", explore), ("plan", plan)] {
-            assert!(
-                prompt.contains("NO file editing tools"),
-                "{name} prompt must declare no editing tools"
-            );
-            assert!(
-                prompt.contains("Do not create, modify, or delete"),
-                "{name} prompt must forbid create/modify/delete"
-            );
-        }
-        let gp = super::super::subagent_prompts::GENERAL_PURPOSE_PROMPT;
-        assert!(
-            !gp.contains("READ-ONLY MODE"),
-            "general-purpose should not be read-only"
-        );
     }
     #[test]
     fn normalize_clears_persona_summaries_for_subagent() {

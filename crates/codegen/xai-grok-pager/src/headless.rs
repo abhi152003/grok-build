@@ -560,7 +560,15 @@ async fn open_session(
     }
 
     let new_resp: acp::NewSessionResponse = acp_send(
-        acp::NewSessionRequest::new(cwd.to_path_buf()).mcp_servers(mcp_servers),
+        acp::NewSessionRequest::new(cwd.to_path_buf())
+            .mcp_servers(mcp_servers)
+            // Fresh `-p` sessions persist as headless so `/resume` keeps them
+            // off its default pages; the load path above never restamps.
+            .meta(
+                serde_json::json!({ "sessionKind": "headless" })
+                    .as_object()
+                    .cloned(),
+            ),
         acp_tx,
     )
     .await?;
@@ -584,7 +592,7 @@ async fn open_session_with_id(
         acp::NewSessionRequest::new(cwd.to_path_buf())
             .mcp_servers(mcp_servers)
             .meta(
-                serde_json::json!({ "sessionId": session_id })
+                serde_json::json!({ "sessionId": session_id, "sessionKind": "headless" })
                     .as_object()
                     .cloned(),
             ),
@@ -618,7 +626,10 @@ async fn fork_then_open(
         ensure_session_id_available(nid, &new_cwd_str)?;
     }
     let parent_is_worktree = parent_session_is_worktree(parent_id, &write_cwd);
-    let payload = fork_session_params(parent_id, &write_cwd, new_id, parent_is_worktree);
+    let mut payload = fork_session_params(parent_id, &write_cwd, new_id, parent_is_worktree);
+    // Shared helper stamps `fork` for interactive `/fork`. `-p` children must
+    // stay headless: the load path below never restamps.
+    payload["sessionKind"] = serde_json::Value::String("headless".into());
     let fork_params = serde_json::value::to_raw_value(&payload)
         .map_err(|e| anyhow::anyhow!("serialize fork params: {e}"))?;
     let req = acp::ExtRequest::new("x.ai/session/fork", fork_params.into());
@@ -740,6 +751,7 @@ fn headless_materialize_ctx(
             crate::app::session_startup::TitleResolution::Allowed
         },
         restore_code,
+        recent_session_selection: crate::app::session_startup::RecentSessionSelection::Any,
         restore_progress_on_stdout: false,
     }
 }
@@ -792,8 +804,7 @@ pub async fn run_single_turn(
         cli_subagents: None,
         cli_web_search_model: None,
         cli_session_summary_model: None,
-        cli_experimental_memory: false,
-        cli_no_memory: false,
+        memory_enabled_override: None,
         disable_web_search: options.disable_web_search,
         todo_gate: false,
         laziness_debug_log: None,
@@ -806,6 +817,7 @@ pub async fn run_single_turn(
         options.yolo,
         options.permission_mode_flag.as_deref(),
         None,
+        xai_grok_shell::util::config::PermissionMode::Ask,
     );
 
     apply_agent_flag(&options.agent, &mut agent_config);
@@ -1006,14 +1018,12 @@ pub async fn run_single_turn(
 
     let track_active = std::env::var("GROK_TRACK_HEADLESS").is_ok();
     if track_active {
-        let _ = xai_grok_shell::active_sessions::register(
-            xai_grok_shell::active_sessions::ActiveSession {
-                session_id: session_id.clone(),
-                pid: std::process::id(),
-                cwd: cwd.display().to_string(),
-                opened_at: chrono::Utc::now(),
-            },
-        );
+        let _ = xai_grok_active_sessions::register(xai_grok_active_sessions::ActiveSession {
+            session_id: session_id.clone(),
+            pid: std::process::id(),
+            cwd: cwd.display().to_string(),
+            opened_at: chrono::Utc::now(),
+        });
     }
 
     // Seed the reducer's session context BEFORE applying model/effort so a later failure carries it.
@@ -1250,7 +1260,7 @@ pub async fn run_single_turn(
 
     if track_active {
         // Non-blocking flock so a slow/network ~/.grok can't hang exit.
-        let _ = xai_grok_shell::active_sessions::try_unregister(&session_id);
+        let _ = xai_grok_active_sessions::try_unregister(&session_id);
     }
     // A mid-turn ACP close already reaped above; return that error before the normal outcome.
     if connection_closed {
@@ -1287,9 +1297,9 @@ pub async fn run_single_turn(
             let is_max_turns = resp
                 .meta
                 .as_ref()
-                .and_then(|m| m.get("cancellationCategory"))
+                .and_then(|m| m.get(crate::app::CANCELLATION_CATEGORY_KEY))
                 .and_then(|v| v.as_str())
-                == Some("max_turns_reached");
+                == Some(xai_grok_shell::session::commands::MAX_TURNS_REACHED_CATEGORY);
             if is_max_turns {
                 emitter.on_max_turns();
                 emitter.on_end(&stop_reason, sid, rid);
@@ -1359,6 +1369,7 @@ fn reap_request_for_work(
             serde_json::value::to_raw_value(&KillTaskRequest {
                 session_id: session_id.0.to_string(),
                 task_id: id.clone(),
+                source: xai_grok_shell::extensions::task::TaskKillSource::Teardown,
             })?,
         ),
     };

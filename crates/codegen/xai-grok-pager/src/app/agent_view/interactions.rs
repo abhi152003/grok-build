@@ -111,20 +111,42 @@ impl AgentView {
                         } else if is_right {
                             scope.selected = crate::views::permission_view::McpScope::Tool;
                         }
-                    } else if is_right
-                        && let Some(ref h) = perm.bash_highlights
-                        && perm.bash_selection_count < h.highlighted_words.len()
+                        let on_scoped_row = perm
+                            .options
+                            .get(perm.active_idx)
+                            .is_some_and(|o| perm.is_scoped_option(o));
+                        if !on_scoped_row && let Some(idx) = perm.scoped_allow_row_idx() {
+                            perm.active_idx = idx;
+                        }
+                    } else if let Some(len) = perm
+                        .bash_highlights
+                        .as_ref()
+                        .map(|h| h.highlighted_words.len())
                     {
-                        perm.bash_selection_count += 1;
-                    } else if is_left && perm.bash_selection_count > 1 {
-                        perm.bash_selection_count -= 1;
-                    }
-                    let on_scoped_row = perm
-                        .options
-                        .get(perm.active_idx)
-                        .is_some_and(|o| perm.is_scoped_option(o));
-                    if !on_scoped_row && let Some(idx) = perm.scoped_allow_row_idx() {
-                        perm.active_idx = idx;
+                        let on_scoped_row = perm
+                            .options
+                            .get(perm.active_idx)
+                            .is_some_and(|o| perm.is_scoped_option(o));
+                        if !on_scoped_row && let Some(idx) = perm.scoped_row_jump_idx() {
+                            perm.active_idx = idx;
+                        }
+                        let active_row = perm
+                            .options
+                            .get(perm.active_idx)
+                            .map(|o| o.option_id.0.as_ref());
+                        if active_row
+                            == Some(crate::views::permission_view::REJECT_ALWAYS_COMMAND_OPTION_ID)
+                        {
+                            if is_right && perm.bash_deny_selection_count < len {
+                                perm.bash_deny_selection_count += 1;
+                            } else if is_left && perm.bash_deny_selection_count > 1 {
+                                perm.bash_deny_selection_count -= 1;
+                            }
+                        } else if active_row
+                            == Some(crate::views::permission_view::ALLOW_ALWAYS_COMMAND_OPTION_ID)
+                        {
+                            perm.bash_selection_count = perm.step_persisting_allow_scope(is_right);
+                        }
                     }
                     return InputOutcome::Changed;
                 }
@@ -165,7 +187,9 @@ impl AgentView {
                     return InputOutcome::Changed;
                 };
                 if key.code == KeyCode::Enter {
-                    if edit.trimmed().is_some()
+                    if edit
+                        .trimmed()
+                        .is_some_and(|p| !xai_grok_workspace::permission::bash_glob_is_catchall(p))
                         && let Some(opt) = perm
                             .allow_always_command_idx()
                             .and_then(|idx| perm.options.get(idx))
@@ -297,7 +321,7 @@ impl AgentView {
         } else if let Some(slot) = qv.per_question_freeform.get_mut(idx) {
             slot.clear();
         }
-        if !qv.is_feedback() {
+        if !qv.is_feedback_report() {
             qv.focus = QuestionFocus::Navigation;
         }
         self.last_prompt_click_ms = None;
@@ -328,17 +352,41 @@ impl AgentView {
                     return self.dismiss_question_view();
                 }
                 if key!('c', CONTROL).matches(key) {
-                    if qv.is_feedback() {
+                    if qv.is_feedback_report() {
                         return self.clear_feedback_then_dismiss();
                     }
                     qv.focus = QuestionFocus::Navigation;
                     self.last_prompt_click_ms = None;
                     return InputOutcome::Changed;
                 }
+                if qv.is_feedback_report() && crate::input::key::is_paste_key(key) {
+                    let clipboard_text = crate::app::actions::ClipboardTextRead::from_result(
+                        crate::clipboard::system_clipboard_read_text(),
+                    );
+                    return self.handle_paste_key_deferred(clipboard_text);
+                }
                 match self.prompt.route_enter(key) {
-                    EnterOutcome::NewlineInserted => return InputOutcome::Changed,
+                    EnterOutcome::NewlineInserted => {
+                        return InputOutcome::Changed;
+                    }
                     EnterOutcome::Submit => {
+                        if self.paste_probe_in_flight > 0
+                            && self.question_view.as_ref().is_some_and(
+                                crate::views::question_view::QuestionViewState::is_feedback_report,
+                            )
+                        {
+                            self.deferred_send =
+                                Some(crate::app::agent_view::AgentDeferredSend::SubmitFeedback);
+                            return InputOutcome::Changed;
+                        }
                         self.commit_question_freeform();
+                        if self
+                            .question_view
+                            .as_ref()
+                            .is_some_and(|qv| qv.is_feedback_report())
+                        {
+                            return self.submit_question_answers(false);
+                        }
                         let on_last = self
                             .question_view
                             .as_ref()
@@ -1020,13 +1068,14 @@ impl AgentView {
     /// view opened, so typed "additional context" doesn't leak into the
     /// main prompt. Also clears any stashed (tab-hidden) question view.
     fn dismiss_question_view(&mut self) -> InputOutcome {
-        let is_doctor_fix = self.question_view.as_ref().is_some_and(|qv| {
+        let follows_skip_submit = self.question_view.as_ref().is_some_and(|qv| {
             matches!(
                 qv.local_kind,
                 Some(crate::views::question_view::LocalQuestionKind::DoctorFix { .. })
+                    | Some(crate::views::question_view::LocalQuestionKind::FeedbackTrace { .. })
             )
         });
-        if is_doctor_fix {
+        if follows_skip_submit {
             return self.submit_question_answers(true);
         }
         if let Some(qv) = self.question_view.take() {
@@ -1055,6 +1104,28 @@ impl AgentView {
             .is_some_and(|qv| qv.tool_call_id == tool_call_id)
         {
             let _ = self.dismiss_question_view();
+            return true;
+        }
+        if let Some(ev) = self.elicitation_view.as_ref()
+            && ev.tool_call_id == tool_call_id
+        {
+            if ev.is_url_waiting() {
+                return false;
+            }
+            if let Some(mut ev) = self.elicitation_view.take() {
+                let _ = ev.take_response_tx();
+                self.restore_elicitation_prompt(ev.stashed_prompt);
+            }
+            return true;
+        }
+        if self
+            .pending_elicitation
+            .as_ref()
+            .is_some_and(|(req, _)| req.tool_call_id == tool_call_id)
+        {
+            if let Some((_, tx)) = self.pending_elicitation.take() {
+                drop(tx);
+            }
             return true;
         }
         if self
@@ -1107,43 +1178,91 @@ impl AgentView {
     }
     /// Give back the draft a card displaced when it opened.
     ///
-    /// A permission and a plan approval each stash the composer and blank it, so while one is up the composer is not the live editor
-    /// and their stash is what will be restored from. The draft has to go there instead, or that stash puts back whatever the card was
-    /// holding, which for `/feedback` is a report that must never reach the model's input. Casual commenting is the other way round,
-    /// keeping its draft parked and the composer live, so it takes the ordinary restore.
+    /// Permission open: write into `permission_stashed_prompt`. Question open:
+    /// write into its stash — the question owns the live composer as freeform,
+    /// and its close puts the stash back (writing through would first clobber
+    /// the freeform and then be clobbered by the question's own restore).
+    /// Otherwise restore the live composer (plan freeform when approval is
+    /// parked is deliberate; the session draft is already on
+    /// `plan_approval_view.stashed_prompt`).
     pub(crate) fn restore_card_prompt(
         &mut self,
         stashed: crate::views::prompt_widget::StashedPrompt,
     ) {
         if self.permission_stashed_prompt.is_some() {
             self.permission_stashed_prompt = Some(stashed);
-        } else if let Some(pav) = self.plan_approval_view.as_mut() {
-            pav.stashed_prompt = stashed;
+        } else if let Some(qv) = self.question_view.as_mut() {
+            qv.stashed_prompt = stashed;
         } else {
             self.prompt.restore(stashed);
         }
     }
-    /// Close out the bare `/feedback` pane: Enter sends the report, Esc drops it.
-    /// It never reaches the option-selection translation, having no options to translate.
+    /// Close out the `/feedback` report pane: Enter advances to the trace
+    /// question (when offered) or sends, Esc drops the report.
     fn submit_feedback_pane(
         &mut self,
         mut qv: crate::views::question_view::QuestionViewState,
         skipped: bool,
     ) -> InputOutcome {
         let report = qv.feedback_report();
-        if !skipped && report.is_empty() {
+        if !skipped && report.is_empty() && self.prompt.images.is_empty() {
+            crate::unified_log::info(
+                "feedback.submit",
+                None,
+                Some(serde_json::json!({"branch": "empty"})),
+            );
             let freeform = qv.activate_freeform_input();
             self.prompt.set_text_preserving(&freeform);
             self.question_view = Some(qv);
             return InputOutcome::Changed;
         }
+        if !skipped && qv.feedback_offer_trace {
+            let images = self.prompt.drain_images();
+            crate::unified_log::info(
+                "feedback.submit",
+                None,
+                Some(serde_json::json!({
+                    "branch": "trace_question",
+                    "chars": report.chars().count(),
+                    "images": images.len(),
+                })),
+            );
+            xai_grok_telemetry::session_ctx::log_event(
+                xai_grok_telemetry::events::FeedbackTraceCardShown {
+                    reenables_sharing: qv.feedback_offer_reenables_sharing,
+                },
+            );
+            qv.begin_feedback_trace_stage(report, images);
+            self.prompt.set_text_preserving("");
+            self.question_view = Some(qv);
+            return InputOutcome::Changed;
+        }
+        let images = if skipped {
+            Vec::new()
+        } else {
+            self.prompt.drain_images()
+        };
+        crate::unified_log::info(
+            "feedback.submit",
+            None,
+            Some(serde_json::json!({
+                "branch": "send",
+                "skipped": skipped,
+                "chars": report.chars().count(),
+                "images": images.len(),
+            })),
+        );
         self.record_question_pause(&qv);
         self.restore_card_prompt(qv.stashed_prompt);
         self.cleanup_question_state();
         if skipped {
             return InputOutcome::Changed;
         }
-        InputOutcome::Action(Action::SendFeedback(report))
+        InputOutcome::Action(Action::SendFeedback {
+            text: report,
+            images: images.into(),
+            trace: None,
+        })
     }
     pub(super) fn submit_question_answers(&mut self, skipped: bool) -> InputOutcome {
         use xai_grok_tools::implementations::grok_build::ask_user_question::AskUserQuestionExtResponse;
@@ -1151,23 +1270,24 @@ impl AgentView {
         let Some(mut qv) = self.question_view.take() else {
             return InputOutcome::Changed;
         };
-        if qv.is_feedback() {
+        if qv.is_feedback_report() {
             return self.submit_feedback_pane(qv, skipped);
         }
         self.record_question_pause(&qv);
         if let Some(kind) = qv.local_kind.take() {
-            let is_doctor_fix = matches!(
-                kind,
-                crate::views::question_view::LocalQuestionKind::DoctorFix { .. }
-            );
-            let outcome = if skipped && is_doctor_fix {
-                let crate::views::question_view::LocalQuestionKind::DoctorFix { target, .. } = kind
-                else {
-                    unreachable!("doctor fix checked above")
-                };
-                InputOutcome::Action(Action::DoctorFixCancelled(target))
-            } else {
-                translate_local_submit(&qv, kind, skipped)
+            use crate::views::question_view::LocalQuestionKind;
+            let outcome = match (skipped, kind) {
+                (true, LocalQuestionKind::DoctorFix { target, .. }) => {
+                    InputOutcome::Action(Action::DoctorFixCancelled(target))
+                }
+                (true, LocalQuestionKind::FeedbackTrace { report, images }) => {
+                    InputOutcome::Action(Action::SendFeedback {
+                        text: report,
+                        images,
+                        trace: Some(crate::app::actions::FeedbackTraceChoice::NoUpload),
+                    })
+                }
+                (skipped, kind) => translate_local_submit(&qv, kind, skipped),
             };
             self.prompt.restore(qv.stashed_prompt);
             self.cleanup_question_state();
@@ -1220,7 +1340,10 @@ impl AgentView {
     }
     /// Clean up question-related visual state after the question view is
     /// dismissed (submit, cancel, or replacement).
-    fn cleanup_question_state(&mut self) {
+    pub(crate) fn cleanup_question_state(&mut self) {
+        if self.deferred_send == Some(crate::app::agent_view::AgentDeferredSend::SubmitFeedback) {
+            self.deferred_send = None;
+        }
         self.hovered_question_item = None;
         self.question_scrollbar_dragging = false;
         self.hit_question_scrollbar.clear();
@@ -1616,6 +1739,7 @@ mod permission_scope_key_tests {
             },
         );
         perm.bash_selection_count = 2;
+        perm.bash_deny_selection_count = 2;
         agent.permission_queue.push_back(perm);
     }
     /// ←/→ on the "Never allow" (RejectAlways) row must adjust the scope in
@@ -1632,7 +1756,98 @@ mod permission_scope_key_tests {
         assert!(matches!(outcome, InputOutcome::Changed));
         let perm = agent.permission_queue.front().unwrap();
         assert_eq!(perm.active_idx, 3, "cursor must stay on the deny row");
-        assert_eq!(perm.bash_selection_count, 1, "← must still narrow scope");
+        assert_eq!(
+            perm.bash_deny_selection_count, 1,
+            "← on the deny row narrows the deny scope"
+        );
+        assert_eq!(
+            perm.bash_selection_count, 2,
+            "the allow scope is untouched from the deny row"
+        );
+    }
+    /// Dangerous commands pin the scope to the full command: ← must not
+    /// narrow below it, since enforcement ignores dangerous prefix grants and
+    /// a narrowed selection would save a rule that never matches.
+    #[test]
+    fn scope_left_is_clamped_for_dangerous_commands() {
+        let mut agent = make_agent();
+        setup_bash_permission(&mut agent);
+        {
+            let perm = agent.permission_queue.front_mut().unwrap();
+            perm.bash_highlights = Some(
+                xai_grok_workspace::permission::bash_command_splitting::BashCommandHighlights {
+                    prefix: vec![],
+                    highlighted_words: vec!["git".into(), "push".into(), "origin".into()],
+                    suffix: vec![],
+                },
+            );
+            perm.bash_selection_count = 3;
+            perm.active_idx = 0;
+        }
+        let left = KeyEvent::new(KeyCode::Left, KeyModifiers::empty());
+        agent.handle_permission_key(&left);
+        {
+            let perm = agent.permission_queue.front().unwrap();
+            assert_eq!(
+                perm.bash_selection_count, 3,
+                "← must not narrow a dangerous allow below the full scope"
+            );
+        }
+        {
+            let perm = agent.permission_queue.front_mut().unwrap();
+            perm.bash_deny_selection_count = 3;
+            perm.active_idx = 3;
+        }
+        agent.handle_permission_key(&left);
+        let perm = agent.permission_queue.front().unwrap();
+        assert_eq!(
+            perm.bash_deny_selection_count, 2,
+            "← on the deny row narrows even for dangerous commands"
+        );
+        assert!(
+            perm.has_adjustable_scope(),
+            "arrows stay advertised while the deny row is adjustable"
+        );
+    }
+    /// The allow arrow skips an argv-ambiguous intermediate scope (a quoted
+    /// arg with a space) that would persist nothing, landing on the next
+    /// scope that saves a working grant.
+    #[test]
+    fn allow_scope_skips_ambiguous_intermediate() {
+        let mut agent = make_agent();
+        setup_bash_permission(&mut agent);
+        {
+            let perm = agent.permission_queue.front_mut().unwrap();
+            perm.bash_highlights = Some(
+                xai_grok_workspace::permission::bash_command_splitting::BashCommandHighlights {
+                    prefix: vec![],
+                    highlighted_words: vec![
+                        "git".into(),
+                        "show".into(),
+                        "-e".into(),
+                        "A B".into(),
+                        "file".into(),
+                    ],
+                    suffix: vec![],
+                },
+            );
+            perm.bash_selection_count = 3;
+            perm.active_idx = 0;
+        }
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::empty());
+        agent.handle_permission_key(&right);
+        assert_eq!(
+            agent.permission_queue.front().unwrap().bash_selection_count,
+            5,
+            "→ must skip the argv-ambiguous scope 4"
+        );
+        let left = KeyEvent::new(KeyCode::Left, KeyModifiers::empty());
+        agent.handle_permission_key(&left);
+        assert_eq!(
+            agent.permission_queue.front().unwrap().bash_selection_count,
+            3,
+            "← must skip the argv-ambiguous scope 4"
+        );
     }
     /// From a non-scoped row ←/→ still jump the cursor to the AllowAlways
     /// row (the discoverability affordance).
@@ -1720,10 +1935,35 @@ mod permission_scope_key_tests {
             }
         }
     }
-    /// With only the exact `reject-always-command` row present, ←/→ still
-    /// adjust the scope in place on that row; from a neutral row there is no
-    /// allow row to jump to, so the cursor stays put (but the scope keys keep
-    /// working).
+    /// A catch-all pattern must not submit from the editor: the manager would
+    /// silently refuse to persist it, and the user would be re-prompted after
+    /// believing a rule was saved.
+    #[test]
+    fn pattern_editor_refuses_catchall_submit() {
+        let mut agent = make_agent();
+        setup_bash_permission(&mut agent);
+        let e = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::empty());
+        let _ = agent.handle_permission_key(&e);
+        let ctrl_u = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL);
+        let _ = agent.handle_permission_key(&ctrl_u);
+        let star = KeyEvent::new(KeyCode::Char('*'), KeyModifiers::empty());
+        let _ = agent.handle_permission_key(&star);
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::empty());
+        let outcome = agent.handle_permission_key(&enter);
+        assert!(
+            matches!(outcome, InputOutcome::Changed),
+            "catch-all pattern must not submit, got {outcome:?}"
+        );
+        assert_eq!(
+            agent.permission_queue.front().unwrap().focus,
+            crate::views::permission_view::PermissionFocus::PatternEdit,
+            "editor stays open for the user to narrow the pattern"
+        );
+    }
+    /// With only the exact `reject-always-command` row present (the allow row
+    /// may be suppressed as unhonorable), ←/→ adjust the deny scope in place
+    /// on that row, and from a neutral row they land on the deny row — never
+    /// on an invisible allow count.
     #[test]
     fn reject_only_scoped_row_adjusts_in_place_without_allow_jump() {
         let mut agent = make_agent();
@@ -1744,14 +1984,24 @@ mod permission_scope_key_tests {
         {
             let perm = agent.permission_queue.front().unwrap();
             assert_eq!(perm.active_idx, 1, "cursor stays on the deny row");
-            assert_eq!(perm.bash_selection_count, 1, "← must still narrow scope");
+            assert_eq!(
+                perm.bash_deny_selection_count, 1,
+                "← must still narrow the deny scope"
+            );
         }
         agent.permission_queue.front_mut().unwrap().active_idx = 0;
         let right = KeyEvent::new(KeyCode::Right, KeyModifiers::empty());
         let _ = agent.handle_permission_key(&right);
         let perm = agent.permission_queue.front().unwrap();
-        assert_eq!(perm.active_idx, 0, "no allow row -> no cursor jump");
-        assert_eq!(perm.bash_selection_count, 2, "→ must still expand scope");
+        assert_eq!(perm.active_idx, 1, "arrows land on the deny row");
+        assert_eq!(
+            perm.bash_deny_selection_count, 2,
+            "→ expands the deny scope"
+        );
+        assert_eq!(
+            perm.bash_selection_count, 2,
+            "the invisible allow count is untouched"
+        );
     }
     /// Ctrl-F toggles args expansion in both focus modes when the prompt
     /// shows planned MCP args — even when remember_tool_approvals=false

@@ -14,10 +14,11 @@ use crate::session::file_state::FileStateTracker;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use xai_computer_hub_mcp_adapter::McpBridgeHandle;
 use xai_grok_mcp::servers::McpState;
-use xai_grok_tools::notification::types::{ToolNotification, ToolNotificationHandle};
+use xai_grok_tools::notification::AcknowledgedToolNotification;
+use xai_grok_tools::notification::types::ToolNotificationHandle;
 use xai_grok_tools::registry::types::{FinalizedToolset, ToolConfig, ToolServerConfig};
 use xai_hunk_tracker::HunkTrackerHandle;
 use xai_tool_protocol::ToolId;
@@ -129,11 +130,17 @@ pub struct WorkspaceSession {
     system_notify_handle: Option<ToolNotificationHandle>,
     /// Receiver paired with `system_notify_handle`, taken once by the forwarder.
     #[allow(dead_code)]
-    pending_notif_rx:
-        tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<ToolNotification>>>,
+    pending_notif_rx: tokio::sync::Mutex<
+        Option<tokio::sync::mpsc::UnboundedReceiver<AcknowledgedToolNotification>>,
+    >,
     /// Spawned system-notify producers (forwarder, preview-state watcher).
     /// Sync mutex so the sync teardown path can abort without an await.
     system_notify_producers: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Guest↔model path mapping. Set once at bind from `session_root`.
+    path_virtualization: OnceLock<crate::path_virtualization::PathVirtualization>,
+    /// Rewritten bind cwd installed on rebind when path virt turns on after
+    /// the session was first created without `session_root`.
+    cwd_override: OnceLock<PathBuf>,
 }
 struct WorkspaceSessionInner {
     effective_tool_config: Arc<ToolServerConfig>,
@@ -143,12 +150,67 @@ impl std::fmt::Debug for WorkspaceSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WorkspaceSession")
             .field("session_id", &self.session_id)
-            .field("cwd", &self.cwd)
+            .field("cwd", &self.cwd())
             .field("capability_mode", &self.capability_mode)
             .field("depth", &self.depth)
             .field("fork_budget", &self.fork_budget)
             .finish_non_exhaustive()
     }
+}
+/// Copy pre-virt working-tree files into `new` so remounted hunk accept
+/// still sees content written under the old cwd. Skips the dest subtree
+/// and sibling session trees (`/workspace/<other-uuid>`).
+fn relocate_pre_virt_files(old: &Path, new: &Path) {
+    if std::fs::create_dir_all(new).is_err() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(old) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let src = entry.path();
+        if src == new {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(&src) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.is_dir() && uuid::Uuid::parse_str(&entry.file_name().to_string_lossy()).is_ok() {
+            continue;
+        }
+        let dest = new.join(entry.file_name());
+        if dest.symlink_metadata().is_ok() {
+            continue;
+        }
+        if meta.is_dir() {
+            let _ = copy_dir_all(&src, &dest);
+        } else {
+            let _ = std::fs::copy(&src, &dest);
+        }
+    }
+}
+fn copy_dir_all(src: &Path, dest: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&from) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        let to = dest.join(entry.file_name());
+        if meta.is_dir() {
+            copy_dir_all(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
 }
 impl WorkspaceSession {
     pub(crate) fn new(
@@ -167,7 +229,7 @@ impl WorkspaceSession {
         #[allow(dead_code)] system_notifications: bool,
         system_notify_channel: Option<(
             ToolNotificationHandle,
-            tokio::sync::mpsc::UnboundedReceiver<ToolNotification>,
+            tokio::sync::mpsc::UnboundedReceiver<AcknowledgedToolNotification>,
         )>,
     ) -> Self {
         let (system_notify_handle, pending_notif_rx) = match system_notify_channel {
@@ -210,7 +272,48 @@ impl WorkspaceSession {
             #[allow(dead_code)]
             pending_notif_rx: tokio::sync::Mutex::new(pending_notif_rx),
             system_notify_producers: std::sync::Mutex::new(Vec::new()),
+            path_virtualization: OnceLock::new(),
+            cwd_override: OnceLock::new(),
         }
+    }
+    pub(crate) fn set_path_virtualization(
+        &self,
+        mapping: crate::path_virtualization::PathVirtualization,
+    ) {
+        let _ = self.path_virtualization.set(mapping);
+    }
+    /// Install a rewritten bind cwd on a session that already exists.
+    ///
+    /// First-bind `create_session` already constructed `cwd`; rebind only
+    /// fills `OnceLock` path virt and would otherwise leave a stale
+    /// `/workspace` (or `/workspace/artifacts`) cwd against inbound
+    /// `/workspace/<conv>` rewrites. Remounts LocalFs, the checkpoint
+    /// store, the hunk tracker, and the live toolset `Cwd` so relative
+    /// work follows the real session tree.
+    pub(crate) async fn set_cwd_for_virtualization(&self, cwd: PathBuf) -> Result<(), String> {
+        if self.cwd() == cwd.as_path() {
+            return Ok(());
+        }
+        let old = self.cwd().to_path_buf();
+        if old != cwd {
+            let dest = cwd.clone();
+            let _ = tokio::task::spawn_blocking(move || relocate_pre_virt_files(&old, &dest)).await;
+        }
+        if !self.checkpoint_store.remount(&cwd, &self.session_id).await {
+            return Err("checkpoint remount failed".into());
+        }
+        let _ = self.cwd_override.set(cwd.clone());
+        self.async_fs.remount_root(cwd.clone());
+        self.hunk_tracker.set_working_dir(cwd.clone()).await;
+        let toolset = self.toolset();
+        let mut res = toolset.resources.lock().await;
+        res.insert(xai_grok_tools::types::resources::Cwd(cwd));
+        Ok(())
+    }
+    pub(crate) fn path_virtualization(
+        &self,
+    ) -> Option<&crate::path_virtualization::PathVirtualization> {
+        self.path_virtualization.get()
     }
     /// Whether this session opted into `BackgroundTaskCompleted` system
     /// notifications.
@@ -223,12 +326,11 @@ impl WorkspaceSession {
     pub(crate) fn system_notify_handle(&self) -> Option<ToolNotificationHandle> {
         self.system_notify_handle.clone()
     }
-    /// Take the stashed notification receiver (once) for the per-session
-    /// forwarder to own.
+    /// Hand the notification receiver to the forwarder. Works once.
     #[allow(dead_code)]
     pub(crate) async fn take_pending_notif_rx(
         &self,
-    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<ToolNotification>> {
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<AcknowledgedToolNotification>> {
         self.pending_notif_rx.lock().await.take()
     }
     /// True once a producer set has been tracked; finalize spawns at most one
@@ -268,7 +370,7 @@ impl WorkspaceSession {
         &self.session_id
     }
     pub fn cwd(&self) -> &Path {
-        &self.cwd
+        self.cwd_override.get().map_or(&self.cwd, PathBuf::as_path)
     }
     pub fn session_env(&self) -> &Arc<HashMap<String, String>> {
         &self.session_env
@@ -521,6 +623,8 @@ pub struct WorkspaceShared {
     pub(crate) client_ext_sink: arc_swap::ArcSwap<Option<ClientExtSink>>,
     pub(crate) local_registry: xai_computer_hub_sdk::LocalRegistry,
     pub(crate) activity_tracker: std::sync::Arc<crate::activity::ActivityTracker>,
+    /// True after the scheduler-liveness poll task started; reconnects must not start a second one.
+    pub(crate) scheduler_poll_started: std::sync::atomic::AtomicBool,
     /// Runtime-tunable timing/threshold config for the tool server.
     /// Read by the status publisher task and at shutdown.
     pub(crate) status_config: crate::status_config::StatusConfig,
@@ -552,7 +656,7 @@ pub struct WorkspaceShared {
     /// Whether per-session `events.jsonl` recording is enabled
     /// (`GROK_WORKSPACE_EVENTS_ENABLED=true`). When `false`, every
     /// [`session_event_writer`](Self::session_event_writer) hands back an
-    /// [`EventWriter::noop()`](xai_file_utils::events::EventWriter::noop) and
+    /// [`EventWriter::noop()`](xai_grok_session_events::EventWriter::noop) and
     /// no session directory or `events.jsonl` is ever created — the legacy
     /// behaviour, preserved bit-for-bit.
     pub(crate) events_enabled: bool,
@@ -568,7 +672,7 @@ pub struct WorkspaceShared {
     /// `Tool*` events resolve the right writer without a back-reference to
     /// `WorkspaceShared`. Stays empty whenever `events_enabled` is `false`.
     pub(crate) session_event_writers:
-        Arc<dashmap::DashMap<String, xai_file_utils::events::EventWriter>>,
+        Arc<dashmap::DashMap<String, xai_grok_session_events::EventWriter>>,
     /// In-flight before-turn enqueue tasks, keyed by `(session_id, turn)`.
     /// Stored by `on_before_turn`; evicted on every turn-end path. The `After`
     /// turn-hook handler awaits the handle for its ack's `artifact_count`; the
@@ -581,6 +685,8 @@ pub struct WorkspaceShared {
     /// status publisher — see
     /// [`WorkspaceHandle::spawn_producer`](crate::handle::WorkspaceHandle).
     pub(crate) producer_tasks: tokio_util::task::TaskTracker,
+    /// Bind-time probe-then-mount hook. Default no-op until a command is set.
+    pub(crate) bind_mount_hook: arc_swap::ArcSwap<crate::path_virtualization::BindMountHook>,
     /// `(path, size, mtime_ms) → sha256` memo for the client-facing
     /// `workspace.client_fs_*` ops, so unchanged files hash once per
     /// workspace instead of per stat/read.
@@ -612,14 +718,14 @@ impl WorkspaceShared {
     /// `workspace_home/sessions/{session_id}/`.
     ///
     /// When `events_enabled` is `false` this returns
-    /// [`EventWriter::noop()`](xai_file_utils::events::EventWriter::noop)
+    /// [`EventWriter::noop()`](xai_grok_session_events::EventWriter::noop)
     /// WITHOUT touching the cache or the filesystem, so the flag-off path stays
     /// byte-for-byte identical to the legacy behaviour. The returned handle is
     /// `Clone + Send + Sync`; callers emit through it directly.
     pub(crate) fn session_event_writer(
         &self,
         session_id: &str,
-    ) -> xai_file_utils::events::EventWriter {
+    ) -> xai_grok_session_events::EventWriter {
         get_or_open_session_writer(
             self.events_enabled,
             &self.session_event_writers,
@@ -633,7 +739,7 @@ impl WorkspaceShared {
     pub(crate) fn session_event_writer_cached(
         &self,
         session_id: &str,
-    ) -> Option<xai_file_utils::events::EventWriter> {
+    ) -> Option<xai_grok_session_events::EventWriter> {
         if !self.events_enabled {
             return None;
         }
@@ -913,11 +1019,11 @@ impl WorkspaceShared {
 ///   existing `events.jsonl` rather than truncating it.
 pub(crate) fn get_or_open_session_writer(
     enabled: bool,
-    writers: &dashmap::DashMap<String, xai_file_utils::events::EventWriter>,
+    writers: &dashmap::DashMap<String, xai_grok_session_events::EventWriter>,
     workspace_home: &Path,
     session_id: &str,
-) -> xai_file_utils::events::EventWriter {
-    use xai_file_utils::events::EventWriter;
+) -> xai_grok_session_events::EventWriter {
+    use xai_grok_session_events::EventWriter;
     if !enabled {
         return EventWriter::noop();
     }
@@ -947,7 +1053,7 @@ pub(crate) fn get_or_open_session_writer(
 mod tests {
     use super::get_or_open_session_writer;
     use dashmap::DashMap;
-    use xai_file_utils::events::{Event, EventWriter};
+    use xai_grok_session_events::{Event, EventWriter};
     fn count_lines(path: &std::path::Path) -> usize {
         std::fs::read_to_string(path)
             .unwrap()

@@ -1,6 +1,6 @@
 //! System-reminder injection concern for `SessionActor`: reminder policy,
-//! the TodoGate, date/interrupt reminders, and between-turn completion
-//! reminders.
+//! the TodoGate, date reminders, post-cancel interrupt framing, and
+//! between-turn completion reminders.
 use super::*;
 /// Owned snapshot returned by [`SessionActor::collect_todo_gate_input`].
 ///
@@ -173,13 +173,8 @@ pub(crate) fn date_rollover_reminder(
          use {today} as the current date."
     ))
 }
-/// Body of the one-shot interrupt `<system-reminder>` injected on the next real
-/// user turn after a mid-stream abort that left the model with no other signal.
-/// Wrapped in grok's `<system-reminder>` shape by [`SessionActor::push_system_reminder`].
-/// See [`SessionActor::maybe_inject_interrupt_reminder`].
-pub(crate) const INTERRUPT_REMINDER: &str = "[Request interrupted by user]";
 const WORKFLOW_RESULT_SUMMARY_REMINDER_CAP: usize = 4 * 1024;
-const WORKFLOW_OBJECTIVE_REMINDER_CAP: usize = 256;
+pub(super) const WORKFLOW_OBJECTIVE_REMINDER_CAP: usize = 256;
 fn workflow_completion_detail(detail: &str) -> std::borrow::Cow<'_, str> {
     let normalized = detail.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized == detail {
@@ -224,9 +219,10 @@ impl SessionActor {
         }
         body.push_str(&format!(
             "\nIt runs in the background: status snapshots and the final result arrive as \
-             reminders at turn starts, and the user can watch it in /workflows. If it pauses, \
-             it can be resumed by calling the workflow tool with resume_from_run_id: \
-             \"{run_id}\". Keep run ids internal — the user knows runs by display name. No \
+             reminders at turn starts, and the user can watch it in /workflow runs. If it pauses, \
+             it can be resumed by calling the workflow tool with source: \
+             {{ type: \"resume\", resume_from_run_id: \"{run_id}\" }}. Keep run ids internal — \
+             the user knows runs by display name. No \
              action needed unless the user asks."
         ));
         self.push_system_reminder(&body);
@@ -274,28 +270,11 @@ fn format_workflow_status_reminder(
                 xai_grok_tools::util::truncate_str(&objective, WORKFLOW_OBJECTIVE_REMINDER_CAP)
             );
         }
-        if let Some(cur) = run.current_phase.as_deref() {
-            match run.phases.iter().position(|p| p.title == cur) {
-                Some(pos) => {
-                    let _ = write!(buf, "\n  Phase: {} ({}/{})", cur, pos + 1, run.phases.len());
-                }
-                None => {
-                    let _ = write!(buf, "\n  Phase: {cur}");
-                }
-            }
+        if let Some(line) = workflow_phase_line(run) {
+            let _ = write!(buf, "\n  {line}");
         }
-        if !run.agents.is_empty() {
-            let done = run.agents.iter().filter(|a| a.state == "done").count();
-            let running = run.agents.iter().filter(|a| a.state == "running").count();
-            let failed = run.agents.iter().filter(|a| a.state == "failed").count();
-            let mut parts = vec![format!("{done} done")];
-            if running > 0 {
-                parts.push(format!("{running} running"));
-            }
-            if failed > 0 {
-                parts.push(format!("{failed} failed"));
-            }
-            let _ = write!(buf, "\n  Agents: {}", parts.join(", "));
+        if let Some(line) = workflow_agents_line(&run.agents) {
+            let _ = write!(buf, "\n  {line}");
         }
         match run.agent_budget {
             Some(budget) => {
@@ -342,7 +321,8 @@ fn format_workflow_status_reminder(
                 };
                 let _ = write!(
                     buf,
-                    "\n  Resumable: call the workflow tool with resume_from_run_id: \"{}\"{}.",
+                    "\n  Resumable: call the workflow tool with source: {{ type: \"resume\", \
+                     resume_from_run_id: \"{}\" }}{}.",
                     run.run_id, budget_suffix
                 );
             }
@@ -354,7 +334,39 @@ fn format_workflow_status_reminder(
     );
     buf
 }
-fn format_workflow_elapsed(ms: u64) -> String {
+/// "Phase: {title} ({i}/{n})" for a run's current phase, if any; a stale
+/// title absent from the phase list renders bare. Shared by the model-facing
+/// status reminder and the user-facing `/workflow` overview.
+pub(super) fn workflow_phase_line(
+    run: &crate::session::workflow::tracker::WorkflowRunState,
+) -> Option<String> {
+    let cur = run.current_phase.as_deref()?;
+    Some(match run.phases.iter().position(|p| p.title == cur) {
+        Some(pos) => format!("Phase: {} ({}/{})", cur, pos + 1, run.phases.len()),
+        None => format!("Phase: {cur}"),
+    })
+}
+/// "Agents: {done} done[, {running} running][, {failed} failed]" for a
+/// non-empty roster. Shared like [`workflow_phase_line`].
+pub(super) fn workflow_agents_line(
+    agents: &[crate::session::workflow::tracker::WorkflowAgentRow],
+) -> Option<String> {
+    if agents.is_empty() {
+        return None;
+    }
+    let done = agents.iter().filter(|a| a.state == "done").count();
+    let running = agents.iter().filter(|a| a.state == "running").count();
+    let failed = agents.iter().filter(|a| a.state == "failed").count();
+    let mut parts = vec![format!("{done} done")];
+    if running > 0 {
+        parts.push(format!("{running} running"));
+    }
+    if failed > 0 {
+        parts.push(format!("{failed} failed"));
+    }
+    Some(format!("Agents: {}", parts.join(", ")))
+}
+pub(super) fn format_workflow_elapsed(ms: u64) -> String {
     let secs = ms / 1000;
     if secs < 60 {
         format!("{secs}s")
@@ -442,8 +454,9 @@ fn format_workflow_completion_reminder(
             } else {
                 let _ = writeln!(
                     buf,
-                    "  Resumable: call the workflow tool with resume_from_run_id: \"{}\" \
-                     and a raised agent_budget (the resume is rejected while usage is at \
+                    "  Resumable: call the workflow tool with source: {{ type: \"resume\", \
+                     resume_from_run_id: \"{}\" }} and a raised agent_budget (the resume is \
+                     rejected while usage is at \
                      or over the cap).",
                     run.run_id
                 );
@@ -452,8 +465,9 @@ fn format_workflow_completion_reminder(
         if run.status == crate::session::workflow::tracker::WorkflowRunStatus::Failed {
             let _ = writeln!(
                 buf,
-                "  Resumable: call the workflow tool with resume_from_run_id: \"{}\" — \
-                 completed agents replay from the journal and the failed step re-executes.",
+                "  Resumable: call the workflow tool with source: {{ type: \"resume\", \
+                 resume_from_run_id: \"{}\" }} — completed agents replay from the journal and \
+                 the failed step re-executes.",
                 run.run_id
             );
         }
@@ -519,19 +533,24 @@ impl SessionActor {
             "Injected date rollover reminder"
         );
     }
-    /// Inject a one-shot `<system-reminder>` telling the model its previous turn
-    /// was interrupted mid-stream, when nothing else will (no in-flight tool to
-    /// repair into a "cancelled" tool-result, no permission tool-result). The
-    /// flag is armed by [`Self::cancel_running_task`] only on the no-active-tool
-    /// abort path, and is consumed exactly once (caller gates to real user
-    /// prompts). Skipped for the harness that owns this surface; unlike the date-rollover reminder,
-    /// no template scoping applies to an interrupt notice.
-    pub(super) async fn maybe_inject_interrupt_reminder(&self) {
+    /// Frame the already-assembled user turn when a mid-stream abort left the model no other
+    /// signal.
+    /// One-shot; skipped for the harness that owns this surface.
+    /// Verbatim prompts still consume the flag (this is the next real user turn) but keep the
+    /// caller-owned bytes, matching truncation and send-now.
+    /// Callers must gate to `PromptOrigin::User` so synthetic turns leave the flag.
+    pub(super) fn maybe_apply_interrupt_envelope(
+        &self,
+        user_message: String,
+        verbatim: bool,
+    ) -> String {
         if !self.events.take_pending_interrupt_reminder() {
-            return;
+            return user_message;
         }
-        self.push_system_reminder(INTERRUPT_REMINDER);
-        tracing::debug!("Injected prior-turn interrupt reminder");
+        if verbatim {
+            return user_message;
+        }
+        frame_user_turn(INTERRUPT_NOTE, &user_message)
     }
     /// Push a `<system-reminder>`-wrapped user message into the conversation.
     pub(super) fn push_system_reminder(&self, content: &str) {
@@ -866,7 +885,7 @@ mod workflow_reminder_tests {
             .next()
             .unwrap()
             .trim_end();
-        assert!(reminder.contains("resume_from_run_id: \"wf_1\""));
+        assert!(reminder.contains("source: { type: \"resume\", resume_from_run_id: \"wf_1\" }"));
         assert!(rendered_detail.starts_with("first second "));
         assert!(rendered_detail.ends_with('…'));
         assert!(rendered_detail.len() <= WORKFLOW_RESULT_SUMMARY_REMINDER_CAP);

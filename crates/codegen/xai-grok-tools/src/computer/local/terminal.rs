@@ -20,8 +20,8 @@ use crate::computer::local::cgroup::{
 };
 use crate::computer::task_log;
 use crate::computer::types::{
-    BackgroundHandle, ComputerError, KillOutcome, TaskSnapshot, TerminalBackend,
-    TerminalRunRequest, TerminalRunResult,
+    BackgroundHandle, BackgroundedForeground, ComputerError, KillOutcome, KillSource, TaskSnapshot,
+    TerminalBackend, TerminalRunRequest, TerminalRunResult,
 };
 use crate::notification::types::{BashNotificationBase, BashOutputChunk, ToolNotificationHandle};
 use crate::util::truncate::FRONT_BACK_TRUNCATION_MARKER;
@@ -129,6 +129,7 @@ enum TerminalCommand {
     /// Kill a background task.
     Kill {
         task_id: String,
+        source: KillSource,
         reply: oneshot::Sender<KillOutcome>,
     },
 
@@ -140,6 +141,13 @@ enum TerminalCommand {
     BackgroundForeground {
         tool_call_id: String,
         reply: oneshot::Sender<bool>,
+    },
+
+    /// Move ALL running foreground commands to background, optionally scoped to an owner session.
+    /// Used on a mid-turn redirect so in-flight commands are kept alive instead of SIGKILLed.
+    BackgroundForegroundCommands {
+        owner_session_id: Option<String>,
+        reply: oneshot::Sender<Vec<BackgroundedForeground>>,
     },
 
     /// Wait for a background task to finish, with optional timeout.
@@ -293,9 +301,9 @@ struct ProcessState {
     last_notified_total: usize,
     /// Set when a `block=true` waiter consumed this task's result.
     block_waited: bool,
-    /// Set when the model explicitly killed this task via the kill tool,
-    /// or during `kill_all_background_tasks` teardown.
+    /// Display/tombstone: kill tool, UI, or teardown — not a natural exit.
     explicitly_killed: bool,
+    kill_result_delivered: bool,
 
     /// Join handle for reading the state dump from fd 4 (persistent shell only).
     /// When present, the actor collects the dump on process exit and updates
@@ -440,6 +448,7 @@ impl ProcessState {
             completed: self.is_complete(),
             block_waited: self.block_waited,
             explicitly_killed: self.explicitly_killed,
+            kill_result_delivered: self.kill_result_delivered,
             kind: self.kind,
             owner_session_id: self.owner_session_id.clone(),
             description: self.description.clone(),
@@ -688,7 +697,7 @@ impl LocalTerminalActor {
         let mut cmd = tokio::process::Command::new(&prep.binary);
         cmd.args(&prep.args)
             .current_dir(cwd)
-            .stdin(Stdio::null())
+            .stdin(xai_tty_utils::null_stdio())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -812,7 +821,7 @@ impl LocalTerminalActor {
         let mut cmd = tokio::process::Command::new(&prep.binary);
         cmd.args(&prep.args)
             .current_dir(&prep.cwd)
-            .stdin(Stdio::null())
+            .stdin(xai_tty_utils::null_stdio())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -935,8 +944,12 @@ impl LocalTerminalActor {
                 };
                 let _ = reply.send(snapshot);
             }
-            TerminalCommand::Kill { task_id, reply } => {
-                let outcome = self.handle_kill(&task_id).await;
+            TerminalCommand::Kill {
+                task_id,
+                source,
+                reply,
+            } => {
+                let outcome = self.handle_kill(&task_id, source).await;
                 let _ = reply.send(outcome);
             }
             TerminalCommand::WaitForCompletion {
@@ -991,6 +1004,14 @@ impl LocalTerminalActor {
             } => {
                 let found = self.handle_background_foreground(&tool_call_id);
                 let _ = reply.send(found);
+            }
+            TerminalCommand::BackgroundForegroundCommands {
+                owner_session_id,
+                reply,
+            } => {
+                let backgrounded =
+                    self.background_all_foreground_commands(owner_session_id.as_deref());
+                let _ = reply.send(backgrounded);
             }
             TerminalCommand::KillForegroundCommandsByOwner { owner_session_id } => {
                 self.kill_foreground_commands_by_owner(&owner_session_id)
@@ -1115,6 +1136,7 @@ impl LocalTerminalActor {
             last_notified_total: 0,
             block_waited: false,
             explicitly_killed: false,
+            kill_result_delivered: false,
             state_dump_handle,
             owner_session_id: request.owner_session_id.clone(),
             description: request.description.filter(|d| !d.trim().is_empty()),
@@ -1138,7 +1160,7 @@ impl LocalTerminalActor {
         self.processes.insert(internal_id, process_state);
     }
 
-    async fn handle_kill(&mut self, terminal_id: &str) -> KillOutcome {
+    async fn handle_kill(&mut self, terminal_id: &str, source: KillSource) -> KillOutcome {
         let Some(process) = self.processes.get_mut(terminal_id) else {
             return KillOutcome::NotFound;
         };
@@ -1155,13 +1177,28 @@ impl LocalTerminalActor {
         let outcome = kill_and_finalize(process).await;
 
         // Resolve completion waiters immediately, so callers blocked on wait_for_completion() unblock right away.
-        if let Some(waiters) = self.completion_waiters.remove(terminal_id) {
+        let mut any_delivered = false;
+        if let Some(mut waiters) = self.completion_waiters.remove(terminal_id) {
             let snapshot = match self.processes.get(terminal_id) {
                 Some(p) => Some(p.to_task_snapshot(terminal_id).await),
                 None => None,
             };
-            for waiter in waiters {
-                let _ = waiter.reply.send(snapshot.clone());
+            if let Some(last) = waiters.pop() {
+                for waiter in waiters {
+                    if waiter.reply.send(snapshot.clone()).is_ok() {
+                        any_delivered = true;
+                    }
+                }
+                if last.reply.send(snapshot).is_ok() {
+                    any_delivered = true;
+                }
+            }
+        }
+
+        if let Some(process) = self.processes.get_mut(terminal_id) {
+            process.kill_result_delivered = source.marks_result_delivered(any_delivered);
+            if !any_delivered {
+                process.block_waited = false;
             }
         }
 
@@ -1246,6 +1283,7 @@ impl LocalTerminalActor {
             last_notified_total: 0,
             block_waited: false,
             explicitly_killed: false,
+            kill_result_delivered: false,
             // Background commands don't update the canonical shell state —
             // they may run for hours and their env mutations shouldn't leak.
             // Detach the dump reader so its result is discarded (the task
@@ -1637,6 +1675,7 @@ impl LocalTerminalActor {
                     kind: p.kind,
                     block_waited: p.block_waited,
                     explicitly_killed: p.explicitly_killed,
+                    kill_result_delivered: p.kill_result_delivered,
                     owner_session_id: p.owner_session_id.clone(),
                     description: p.description.clone(),
                     is_backgrounded: true,
@@ -1931,6 +1970,69 @@ impl LocalTerminalActor {
         self.transition_to_background(&internal_id, BackgroundReason::UserSignal)
     }
 
+    /// The non-lethal twin of [`Self::kill_foreground_commands`]: on a mid-turn redirect a running command is kept alive, not SIGKILLed.
+    fn background_all_foreground_commands(
+        &mut self,
+        owner_session_id: Option<&str>,
+    ) -> Vec<BackgroundedForeground> {
+        // Collect internal ids first: `transition_to_background` re-keys the map, so we cannot hold an iterator across the mutation.
+        let targets: Vec<(String, BackgroundedForeground)> = self
+            .processes
+            .iter()
+            .filter(|(_, p)| {
+                !p.bg_status.is_backgrounded()
+                    && !p.lifecycle.has_exited()
+                    && owner_session_id
+                        .is_none_or(|owner| p.owner_session_id.as_deref() == Some(owner))
+            })
+            .map(|(id, p)| {
+                (
+                    id.clone(),
+                    BackgroundedForeground {
+                        tool_call_id: p.tool_call_id.clone(),
+                    },
+                )
+            })
+            .collect();
+
+        let mut backgrounded = Vec::with_capacity(targets.len());
+        for (internal_id, info) in targets {
+            if self.transition_to_background(&internal_id, BackgroundReason::UserSignal) {
+                // The transition above re-keys the map, so the process now sits under its tool call id.
+                if let Some(process) = self.processes.get(&info.tool_call_id) {
+                    Self::announce_backgrounded_command(process);
+                }
+                backgrounded.push(info);
+            }
+        }
+        backgrounded
+    }
+
+    /// Normally the bash tool tells the client itself when its command moves to the background, but its turn was stopped, so it usually never runs again.
+    /// If it does still run, the client hears about the command twice, which is better than never seeing it at all.
+    fn announce_backgrounded_command(process: &ProcessState) {
+        process.notification_handle.send_backgrounded(
+            crate::notification::BashExecutionBackgrounded {
+                base: crate::notification::BashNotificationBase {
+                    tool_call_id: process.tool_call_id.clone(),
+                    command: process
+                        .display_command
+                        .clone()
+                        .unwrap_or_else(|| process.command.clone()),
+                    // The shell drops these three before the wire, so copying the whole buffer here would be wasted work.
+                    output: Vec::new(),
+                    total_bytes: 0,
+                    truncated: false,
+                    cwd: std::path::PathBuf::from(&process.cwd),
+                },
+                output_file: process.output_file.clone(),
+                task_id: process.tool_call_id.clone(),
+                monitor_description: None,
+                description: process.description.clone().filter(|d| !d.trim().is_empty()),
+            },
+        );
+    }
+
     /// Kill all non-backgrounded (foreground) processes and notify their waiters.
     /// Backgrounded processes are left untouched. The actor stays alive for reuse.
     ///
@@ -2039,10 +2141,7 @@ impl LocalTerminalActor {
             .collect();
 
         for id in owned_ids {
-            if let Some(process) = self.processes.get_mut(&id) {
-                process.explicitly_killed = true;
-            }
-            self.handle_kill(&id).await;
+            self.handle_kill(&id, KillSource::Teardown).await;
         }
     }
 
@@ -2497,11 +2596,17 @@ impl TerminalBackend for LocalTerminalBackend {
     }
 
     async fn kill_task(&self, task_id: &str) -> KillOutcome {
+        self.kill_task_with_source(task_id, KillSource::ModelTool)
+            .await
+    }
+
+    async fn kill_task_with_source(&self, task_id: &str, source: KillSource) -> KillOutcome {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
             .cmd_tx
             .send(TerminalCommand::Kill {
                 task_id: task_id.to_string(),
+                source,
                 reply: reply_tx,
             })
             .await
@@ -2571,7 +2676,8 @@ impl TerminalBackend for LocalTerminalBackend {
         let tasks = self.list_tasks().await;
         for task in tasks {
             if task.exit_code.is_none() && task.signal.is_none() {
-                self.kill_task(&task.task_id).await;
+                self.kill_task_with_source(&task.task_id, KillSource::Teardown)
+                    .await;
             }
         }
     }
@@ -2645,6 +2751,25 @@ impl TerminalBackend for LocalTerminalBackend {
             return false;
         }
         reply_rx.await.unwrap_or(false)
+    }
+
+    async fn background_foreground_commands(
+        &self,
+        owner_session_id: Option<&str>,
+    ) -> Vec<BackgroundedForeground> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .cmd_tx
+            .send(TerminalCommand::BackgroundForegroundCommands {
+                owner_session_id: owner_session_id.map(str::to_string),
+                reply: reply_tx,
+            })
+            .await
+            .is_err()
+        {
+            return Vec::new();
+        }
+        reply_rx.await.unwrap_or_default()
     }
 }
 
@@ -2999,9 +3124,9 @@ async fn capture_login_env() -> HashMap<String, String> {
     let result = tokio::time::timeout(Duration::from_secs(5), async {
         let mut cmd = tokio::process::Command::new(shell.binary_path());
         cmd.args(["-lc", &script])
-            .stdin(Stdio::null())
+            .stdin(xai_tty_utils::null_stdio())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(xai_tty_utils::null_stdio())
             .kill_on_drop(true);
         crate::util::detach_command(&mut cmd);
         cmd.envs(crate::util::pager_env());
@@ -3175,7 +3300,7 @@ fn spawn_shell_command(
         cmd.arg("-c")
             .arg(&wrapped_command)
             .current_dir(cwd)
-            .stdin(Stdio::null())
+            .stdin(xai_tty_utils::null_stdio())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             // NOTE: do NOT set .process_group(0) here — std runs setpgid()
@@ -3214,7 +3339,7 @@ fn spawn_shell_command(
         let mut cmd = tokio::process::Command::new(&inv.program);
         cmd.args(&inv.args)
             .current_dir(cwd)
-            .stdin(Stdio::null())
+            .stdin(xai_tty_utils::null_stdio())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -3591,6 +3716,81 @@ mod tests {
             matches!(outcome, KillOutcome::Killed | KillOutcome::AlreadyExited),
             "kill after auto-bg should succeed: {outcome:?}"
         );
+        let _ = tokio::fs::remove_file(&output_file).await;
+    }
+
+    // A mid-turn redirect backgrounds a running foreground command instead of killing it, and the blocking `run` returns a "backgrounded" signal.
+    #[tokio::test]
+    async fn test_background_foreground_commands_keeps_process_alive() {
+        let backend = std::sync::Arc::new(LocalTerminalBackend::new());
+
+        let output_file =
+            std::env::temp_dir().join(format!("terminal-test-bg-all-{}.out", std::process::id()));
+        let tool_call_id = "test-bg-all";
+
+        let request = TerminalRunRequest {
+            command: "sleep 60".to_string(),
+            working_directory: PathBuf::from("/tmp"),
+            env: HashMap::new(),
+            timeout: Duration::from_secs(60),
+            output_byte_limit: 10000,
+            output_file: output_file.clone(),
+            notification_handle: ToolNotificationHandle::noop(),
+            tool_call_id: tool_call_id.to_string(),
+            display_command: None,
+            // Not auto-backgroundable: this must be backgrounded on demand, not by a timeout, and must never be killed.
+            auto_background_on_timeout: false,
+            foreground_block_budget: None,
+            kind: TaskKind::Bash,
+            owner_session_id: None,
+            description: None,
+        };
+
+        // Run the foreground command on a task; `run` blocks until the command is backgrounded (or finishes).
+        let run_backend = backend.clone();
+        let run = tokio::spawn(async move { run_backend.run(request).await });
+
+        // Give the process time to spawn and register as a foreground process.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let backgrounded = backend.background_foreground_commands(None).await;
+
+        assert_eq!(
+            backgrounded.len(),
+            1,
+            "the running command was backgrounded"
+        );
+        assert_eq!(backgrounded[0].tool_call_id, tool_call_id);
+
+        // The blocking run returns a backgrounded (not killed/cancelled) result.
+        let result = run.await.unwrap().unwrap();
+        assert_eq!(
+            result.signal.as_deref(),
+            Some("backgrounded"),
+            "run must return a backgrounded signal, got {:?}",
+            result.signal
+        );
+
+        // The process is still alive and queryable under its tool_call_id.
+        let snapshot = backend
+            .get_task(tool_call_id)
+            .await
+            .expect("backgrounded task should be queryable by tool_call_id");
+        assert!(
+            !snapshot.completed,
+            "the backgrounded process must still be running, not killed"
+        );
+
+        // A second call is a no-op (nothing left in the foreground).
+        assert!(
+            backend
+                .background_foreground_commands(None)
+                .await
+                .is_empty(),
+            "no foreground commands remain after backgrounding"
+        );
+
+        let _ = backend.kill_task(tool_call_id).await;
         let _ = tokio::fs::remove_file(&output_file).await;
     }
 
@@ -5186,6 +5386,125 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn wait_on_already_completed_task_returns_immediately() {
+        let backend = LocalTerminalBackend::new();
+        let bg = backend
+            .run_background(make_request("echo already-done"))
+            .await
+            .expect("spawn");
+        assert!(
+            poll_until_task_completed(&backend, &bg.task_id, Duration::from_secs(5)).await,
+            "echo should finish"
+        );
+
+        let started = Instant::now();
+        let snap = backend
+            .wait_for_completion(&bg.task_id, Some(Duration::from_secs(600)))
+            .await
+            .expect("completed snapshot");
+        assert!(snap.completed);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "already-completed wait must not burn the 600s cap; elapsed {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_on_already_killed_task_returns_immediately() {
+        let backend = LocalTerminalBackend::new();
+        let bg = backend
+            .run_background(make_request("sleep 60"))
+            .await
+            .expect("spawn");
+        assert_eq!(backend.kill_task(&bg.task_id).await, KillOutcome::Killed);
+        assert!(
+            poll_until_task_completed(&backend, &bg.task_id, Duration::from_secs(5)).await,
+            "kill should complete the task"
+        );
+
+        let started = Instant::now();
+        let snap = backend
+            .wait_for_completion(&bg.task_id, Some(Duration::from_secs(600)))
+            .await
+            .expect("killed snapshot");
+        assert!(snap.completed);
+        assert!(snap.explicitly_killed);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "already-killed wait must not burn the 600s cap; elapsed {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_on_tombstoned_task_returns_immediately() {
+        let ttl = Duration::from_millis(100);
+        let backend = LocalTerminalBackend::new_with_completed_task_ttl(ttl);
+        let bg = backend
+            .run_background(make_request("echo tombstone-wait"))
+            .await
+            .expect("spawn");
+        assert!(
+            poll_until_task_completed(&backend, &bg.task_id, Duration::from_secs(5)).await,
+            "echo should finish"
+        );
+        tokio::time::sleep(ttl + Duration::from_millis(250)).await;
+
+        let started = Instant::now();
+        let snap = backend
+            .wait_for_completion(&bg.task_id, Some(Duration::from_secs(600)))
+            .await
+            .expect("tombstone snapshot");
+        assert!(snap.completed);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "tombstone wait must not burn the 600s cap; elapsed {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_on_unknown_task_returns_immediately() {
+        let backend = LocalTerminalBackend::new();
+        let started = Instant::now();
+        let snap = backend
+            .wait_for_completion("never-existed", Some(Duration::from_secs(600)))
+            .await;
+        assert!(snap.is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "not-found wait must not burn the 600s cap; elapsed {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_on_still_running_task_times_out() {
+        let backend = LocalTerminalBackend::new();
+        let bg = backend
+            .run_background(make_request("sleep 60"))
+            .await
+            .expect("spawn");
+
+        let started = Instant::now();
+        let snap = backend
+            .wait_for_completion(&bg.task_id, Some(Duration::from_millis(200)))
+            .await
+            .expect("timeout snapshot");
+        assert!(
+            !snap.completed,
+            "still-running wait must not take the already-terminal path"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(150),
+            "still-running wait must block until its timeout; elapsed {:?}",
+            started.elapsed()
+        );
+        let _ = backend.kill_task(&bg.task_id).await;
+    }
+
     /// A blocking wait whose receiver is dropped before the task completes
     /// (the awaiting turn was cancelled, e.g. Ctrl+C mid
     /// `get_command_or_subagent_output`) must NOT leave `block_waited=true`
@@ -5286,6 +5605,208 @@ mod tests {
             "block_waited must remain true when at least one waiter received \
              the completion — auto-wake would be redundant"
         );
+    }
+
+    #[tokio::test]
+    async fn kill_with_live_waiter_marks_result_delivered() {
+        for source in [KillSource::ClientUi, KillSource::ModelTool] {
+            let backend = LocalTerminalBackend::new();
+            let mut req = make_request("sleep 60");
+            req.tool_call_id = format!("live-waiter-{source:?}");
+            let bg = backend.run_background(req).await.expect("spawn");
+
+            let waiter_backend = backend.clone();
+            let task_id = bg.task_id.clone();
+            let wait = tokio::spawn(async move {
+                waiter_backend
+                    .wait_for_completion(&task_id, Some(Duration::from_secs(30)))
+                    .await
+            });
+            let waiter_deadline = std::time::Instant::now() + Duration::from_secs(2);
+            let waiter_ready = loop {
+                if backend
+                    .get_task(&bg.task_id)
+                    .await
+                    .is_some_and(|s| s.block_waited)
+                {
+                    break true;
+                }
+                if std::time::Instant::now() >= waiter_deadline {
+                    break false;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            assert!(
+                waiter_ready,
+                "waiter must register before kill ({source:?})"
+            );
+
+            assert_eq!(
+                backend.kill_task_with_source(&bg.task_id, source).await,
+                KillOutcome::Killed
+            );
+            let snap = backend.get_task(&bg.task_id).await.expect("killed task");
+            assert!(snap.explicitly_killed, "{source:?}");
+            assert!(
+                snap.kill_result_delivered,
+                "live waiter must mark kill_result_delivered ({source:?})"
+            );
+            assert!(
+                snap.block_waited,
+                "live waiter must keep block_waited ({source:?})"
+            );
+            assert!(
+                snap.is_auto_wake_suppressed(),
+                "delivered kill must suppress ({source:?})"
+            );
+            let waited = wait.await.expect("join").expect("wait snapshot");
+            assert!(waited.completed, "{source:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn kill_with_dropped_waiter_clears_block_waited() {
+        for source in [KillSource::ClientUi, KillSource::ModelTool] {
+            let backend = LocalTerminalBackend::new();
+            let mut req = make_request("sleep 60");
+            req.tool_call_id = format!("dropped-waiter-{source:?}");
+            let bg = backend.run_background(req).await.expect("spawn");
+
+            let cancelled = tokio::time::timeout(
+                Duration::from_millis(100),
+                backend.wait_for_completion(&bg.task_id, Some(Duration::from_secs(120))),
+            )
+            .await;
+            assert!(cancelled.is_err(), "wait must be cancelled ({source:?})");
+
+            assert_eq!(
+                backend.kill_task_with_source(&bg.task_id, source).await,
+                KillOutcome::Killed
+            );
+            let snap = backend.get_task(&bg.task_id).await.expect("killed task");
+            assert!(snap.explicitly_killed, "{source:?}");
+            assert!(
+                !snap.block_waited,
+                "dropped waiter must clear block_waited ({source:?})"
+            );
+            let expect_delivered = source.marks_result_delivered(false);
+            assert_eq!(snap.kill_result_delivered, expect_delivered, "{source:?}");
+            assert_eq!(
+                snap.is_auto_wake_suppressed(),
+                expect_delivered,
+                "ClientUi + dropped waiter must wake; ModelTool still suppresses ({source:?})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn kill_without_waiter_delivery_depends_on_source() {
+        // Hardcoded per-source so a no-op handle_kill or a formula change fails.
+        for (source, expect_delivered) in [
+            (KillSource::ClientUi, false),
+            (KillSource::ModelTool, true),
+            (KillSource::Teardown, true),
+        ] {
+            let backend = LocalTerminalBackend::new();
+            let mut req = make_request("sleep 60");
+            req.tool_call_id = format!("no-waiter-{source:?}");
+            let bg = backend.run_background(req).await.expect("spawn");
+
+            assert_eq!(
+                backend.kill_task_with_source(&bg.task_id, source).await,
+                KillOutcome::Killed
+            );
+            let snap = backend.get_task(&bg.task_id).await.expect("killed task");
+            assert!(snap.explicitly_killed, "{source:?}");
+            assert!(!snap.block_waited, "{source:?}");
+            assert_eq!(snap.kill_result_delivered, expect_delivered, "{source:?}");
+            assert_eq!(
+                snap.is_auto_wake_suppressed(),
+                expect_delivered,
+                "{source:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn kill_task_defaults_to_model_tool_source() {
+        let backend = LocalTerminalBackend::new();
+        let mut req = make_request("sleep 60");
+        req.tool_call_id = "default-model-tool".into();
+        let bg = backend.run_background(req).await.expect("spawn");
+        assert_eq!(backend.kill_task(&bg.task_id).await, KillOutcome::Killed);
+        let snap = backend.get_task(&bg.task_id).await.expect("killed task");
+        assert!(snap.explicitly_killed);
+        assert!(
+            snap.kill_result_delivered,
+            "bare kill_task is a model-tool kill"
+        );
+        assert!(snap.is_auto_wake_suppressed());
+    }
+
+    #[tokio::test]
+    async fn teardown_sweeps_mark_result_delivered() {
+        let backend = LocalTerminalBackend::new();
+        let mut owned = make_request("sleep 60");
+        owned.tool_call_id = "teardown-owned".into();
+        owned.owner_session_id = Some("session-a".into());
+        let owned = backend.run_background(owned).await.expect("spawn");
+
+        let mut unowned = make_request("sleep 60");
+        unowned.tool_call_id = "teardown-all".into();
+        let unowned = backend.run_background(unowned).await.expect("spawn");
+
+        backend
+            .kill_all_background_tasks_by_owner("session-a")
+            .await;
+        let snap = backend.get_task(&owned.task_id).await.expect("owned");
+        assert!(snap.completed && snap.explicitly_killed);
+        assert!(
+            snap.kill_result_delivered && snap.is_auto_wake_suppressed(),
+            "owner teardown must suppress auto-wake"
+        );
+
+        backend.kill_all_background_tasks().await;
+        let snap = backend.get_task(&unowned.task_id).await.expect("unowned");
+        assert!(snap.completed && snap.explicitly_killed);
+        assert!(
+            snap.kill_result_delivered && snap.is_auto_wake_suppressed(),
+            "global teardown must suppress auto-wake"
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_bits_survive_ttl_eviction() {
+        let ttl = Duration::from_millis(100);
+        let backend = LocalTerminalBackend::new_with_completed_task_ttl(ttl);
+        for (source, expect_delivered) in
+            [(KillSource::ModelTool, true), (KillSource::ClientUi, false)]
+        {
+            let mut req = make_request("sleep 60");
+            req.tool_call_id = format!("evict-kill-{source:?}");
+            let bg = backend.run_background(req).await.expect("spawn");
+            assert_eq!(
+                backend.kill_task_with_source(&bg.task_id, source).await,
+                KillOutcome::Killed
+            );
+            assert!(
+                poll_until_task_completed(&backend, &bg.task_id, Duration::from_secs(5)).await,
+                "killed task should complete ({source:?})"
+            );
+            tokio::time::sleep(ttl + Duration::from_millis(250)).await;
+            let snap = backend
+                .get_task(&bg.task_id)
+                .await
+                .expect("tombstone must remain queryable");
+            assert!(snap.completed, "{source:?}");
+            assert!(snap.explicitly_killed, "{source:?}");
+            assert_eq!(snap.kill_result_delivered, expect_delivered, "{source:?}");
+            assert_eq!(
+                snap.is_auto_wake_suppressed(),
+                expect_delivered,
+                "{source:?}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

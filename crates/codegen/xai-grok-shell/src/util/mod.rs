@@ -4,6 +4,7 @@ pub mod grok_auth_credentials;
 pub mod hooks;
 pub mod limits;
 pub(crate) mod subprocess;
+pub(crate) mod text_sanitize;
 pub(crate) mod user_identity;
 
 // The foundation utilities live in `xai-grok-shell-base` (upstream of this
@@ -16,7 +17,7 @@ pub(crate) fn is_user_instruction_path(
     path: &std::path::Path,
     grok_home: &std::path::Path,
     vendor_homes: &[(std::path::PathBuf, bool)],
-    workspace_root: Option<&std::path::Path>,
+    workspace_roots: &[&std::path::Path],
 ) -> bool {
     let parent = path.parent();
     let grok_rules = grok_home.join("rules");
@@ -30,7 +31,8 @@ pub(crate) fn is_user_instruction_path(
     if is_exact_home_surface {
         return true;
     }
-    if workspace_root.is_some_and(|root| path.starts_with(root)) {
+    // Both prefixes are workspace because forks mix display-rewritten and on-disk paths.
+    if workspace_roots.iter().any(|root| path.starts_with(root)) {
         return false;
     }
     path.starts_with(grok_home)
@@ -121,13 +123,13 @@ mod is_user_instruction_path_tests {
             Path::new("/repo/config/AGENTS.md"),
             Path::new("/repo/config"),
             &[],
-            Some(Path::new("/repo")),
+            &[Path::new("/repo")],
         ));
         assert!(!is_user_instruction_path(
             Path::new("/repo/config/src/AGENTS.md"),
             Path::new("/repo/config"),
             &[],
-            Some(Path::new("/repo")),
+            &[Path::new("/repo")],
         ));
     }
 
@@ -137,7 +139,7 @@ mod is_user_instruction_path_tests {
             Path::new("/custom/grok/worktrees/repo/src/AGENTS.md"),
             Path::new("/custom/grok"),
             &[],
-            Some(Path::new("/custom/grok/worktrees/repo")),
+            &[Path::new("/custom/grok/worktrees/repo")],
         ));
     }
 }

@@ -1521,7 +1521,7 @@ fn stale_context_info_results_do_not_update_replaced_session() {
             agent_id: id,
             session_id: "test-session".into(),
             info: Box::new(context_info_response()),
-            nonce: 0,
+            nonce: Default::default(),
         }),
         &mut app,
     );
@@ -1530,7 +1530,7 @@ fn stale_context_info_results_do_not_update_replaced_session() {
             agent_id: id,
             session_id: "test-session".into(),
             error: "request failed".to_string(),
-            nonce: 0,
+            nonce: Default::default(),
         }),
         &mut app,
     );
@@ -1606,7 +1606,7 @@ fn minimal_update_notice_commits_a_system_block() {
     assert_eq!(agent_scrollback_len(&app), before + 1);
     let text = last_system_text(&app, AgentId(0));
     assert!(text.contains("Update available: v9.9.9"), "got: {text:?}");
-    assert!(text.contains("restart to apply"), "got: {text:?}");
+    assert!(text.contains("Restart to apply."), "got: {text:?}");
 }
 
 #[test]
@@ -1702,6 +1702,11 @@ fn usage_results_populate_open_modal_not_scrollback() {
             session_id: "test-session".into(),
             info: Box::new(context_info_response()),
             text: "  Session ID: test-session".to_string(),
+            fields: vec![crate::views::usage_modal::SessionInfoField {
+                label: "Session ID",
+                value: "test-session".to_string(),
+                compact: false,
+            }],
             nonce,
         }),
         &mut app,
@@ -1719,10 +1724,12 @@ fn usage_results_populate_open_modal_not_scrollback() {
     assert_eq!(agent_scrollback_len(&app), before);
     let state = usage_modal_state(&app);
     assert!(state.session_usage_text.is_some());
-    assert_eq!(
-        state.session_text.as_deref(),
-        Some("  Session ID: test-session")
-    );
+    let fields = state
+        .session_fields
+        .as_ref()
+        .expect("session fields populated");
+    assert_eq!(fields.len(), 1);
+    assert_eq!(fields[0].value, "test-session");
     assert!(state.context.is_some());
 }
 
@@ -1736,7 +1743,7 @@ fn usage_results_without_open_modal_are_dropped_in_full_mode() {
             agent_id: AgentId(0),
             session_id: "test-session".into(),
             error: "boom".to_string(),
-            nonce: 0,
+            nonce: Default::default(),
         }),
         &mut app,
     );
@@ -1745,7 +1752,7 @@ fn usage_results_without_open_modal_are_dropped_in_full_mode() {
             agent_id: AgentId(0),
             session_id: "test-session".into(),
             error: "boom".to_string(),
-            nonce: 0,
+            nonce: Default::default(),
         }),
         &mut app,
     );
@@ -1768,11 +1775,16 @@ fn reply_from_previous_modal_open_is_dropped() {
             session_id: "test-session".into(),
             info: Box::new(context_info_response()),
             text: "  Session ID: from-old-open".to_string(),
+            fields: vec![crate::views::usage_modal::SessionInfoField {
+                label: "Session ID",
+                value: "from-old-open".to_string(),
+                compact: false,
+            }],
             nonce: old_nonce,
         }),
         &mut app,
     );
-    assert!(usage_modal_state(&app).session_text.is_none());
+    assert!(usage_modal_state(&app).session_fields.is_none());
 }
 
 #[test]
@@ -1786,11 +1798,16 @@ fn stale_session_info_does_not_populate_modal() {
             session_id: "old-session".into(),
             info: Box::new(context_info_response()),
             text: "  Session ID: old-session".to_string(),
+            fields: vec![crate::views::usage_modal::SessionInfoField {
+                label: "Session ID",
+                value: "old-session".to_string(),
+                compact: false,
+            }],
             nonce,
         }),
         &mut app,
     );
-    assert!(usage_modal_state(&app).session_text.is_none());
+    assert!(usage_modal_state(&app).session_fields.is_none());
 }
 
 #[test]
